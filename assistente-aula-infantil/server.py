@@ -3,7 +3,7 @@ import os
 from flask import Flask, request, jsonify, Response
 from activities import build_daily_activity, check_answer
 from leitura import get_today_reading_goal, check_reading_submission
-from progress import next_levels_for_user, init_user_if_needed
+from progress import init_user_if_needed
 from storage import load_db, save_db
 
 # Twilio REST (opcional para envios proativos) + TwiML (resposta imediata)
@@ -96,16 +96,35 @@ def bot_webhook():
         )
         return reply_twiml(msg)
 
+    # -------------------------
+    # Aceita "resposta 9" ou "resposta9" (sem espaço)
     if low.startswith("resposta"):
-        answer = text.split(" ", 1)[1] if " " in text else ""
+        # pega tudo após 'resposta' (com ou sem espaço, removendo separadores comuns)
+        after = text[len("resposta"):].strip()
+        if not after and " " in text:
+            after = text.split(" ", 1)[1].strip()
+        answer = after.lstrip(":.-").strip()
+        if not answer:
+            return reply_twiml("Envie no formato: *resposta 10* (ou apenas o número).")
         result_txt = check_answer(user, answer)
         db = load_db(); db["users"][user_id] = user; save_db(db)
         return reply_twiml(result_txt)
+    # -------------------------
 
     if low.startswith("leitura ok"):
         ok, msg = check_reading_submission(user)
         db = load_db(); db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg)
+
+    # -------------------------
+    # Fallback: se há exercício pendente e não é comando conhecido,
+    # trate a mensagem inteira como tentativa de resposta (ex.: "9")
+    KNOWN = {"menu", "ajuda", "help", "status", "iniciar"}
+    if user.get("pending") and low not in KNOWN and not low.startswith("leitura ok"):
+        result_txt = check_answer(user, text)
+        db = load_db(); db["users"][user_id] = user; save_db(db)
+        return reply_twiml(result_txt)
+    # -------------------------
 
     return reply_twiml("Não entendi. Digite *menu* para ajuda.")
 
