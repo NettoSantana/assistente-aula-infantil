@@ -1,12 +1,12 @@
-# server.py — Assistente de Aula Infantil (responde via TwiML e mantém envio via Twilio REST opcional)
+# server.py — Assistente de Aula Infantil (responde via TwiML; mantém envio REST opcional)
 import os
 from flask import Flask, request, jsonify, Response
 from activities import build_daily_activity, check_answer
 from leitura import get_today_reading_goal, check_reading_submission
-from progress import init_user_if_needed
+from progress import next_levels_for_user, init_user_if_needed
 from storage import load_db, save_db
 
-# Twilio SDK (REST opcional) e TwiML (resposta imediata)
+# Twilio REST (opcional para envios proativos) + TwiML (resposta imediata)
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -15,20 +15,15 @@ app = Flask(__name__)
 # Identidade do projeto
 PROJECT_NAME = os.getenv("PROJECT_NAME", "assistente_aula_infantil")
 
-# Credenciais/Remetente Twilio (REST opcional)
+# Credenciais/Remetente Twilio (somente se você for usar REST proativo)
 TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-# Para WhatsApp use "whatsapp:+19133957848"; para SMS use "+19133957848"
+# Para SMS: "+19133957848" | Para WhatsApp: "whatsapp:+19133957848"
 TWILIO_FROM  = os.getenv("TWILIO_FROM", "")
 
 _twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
 
 def _normalize_from_for_channel(to: str, from_cfg: str) -> str:
-    """
-    Garante que o FROM corresponde ao canal do TO (apenas para REST opcional).
-    - Se o destino começa com 'whatsapp:', o FROM também precisa.
-    - Se o destino for SMS (sem 'whatsapp:'), o FROM não pode ter 'whatsapp:'.
-    """
     if not from_cfg:
         return from_cfg
     if to.startswith("whatsapp:") and not from_cfg.startswith("whatsapp:"):
@@ -38,10 +33,7 @@ def _normalize_from_for_channel(to: str, from_cfg: str) -> str:
     return from_cfg
 
 def send_message(user_id: str, text: str):
-    """
-    Envia mensagem via REST (opcional). Para resposta imediata ao webhook,
-    usamos TwiML mais abaixo.
-    """
+    """Envio REST opcional (não usado para responder ao webhook)."""
     if not (_twilio_client and TWILIO_FROM):
         print(f"[SEND LOG → {user_id}] {text}")
         return
@@ -53,7 +45,7 @@ def send_message(user_id: str, text: str):
         print(f"[SEND LOG (fallback) → {user_id}] {text}")
 
 def reply_twiml(text: str) -> Response:
-    """Responde ao webhook com TwiML (garante entrega imediata e elimina 12200)."""
+    """Responde imediatamente ao WhatsApp/SMS com TwiML (evita 12200)."""
     r = MessagingResponse()
     r.message(text)
     return Response(str(r), mimetype="application/xml", status=200)
@@ -74,7 +66,7 @@ def bot_webhook():
     user = init_user_if_needed(db, user_id)
 
     if low in {"menu", "ajuda", "help"}:
-        msg = (
+        reply = (
             "📚 *Assistente de Aula*\n"
             "Comandos:\n"
             "- *iniciar*: recebe a atividade do dia (mat/port/leitura)\n"
@@ -82,22 +74,21 @@ def bot_webhook():
             "- *leitura ok*: confirma envio do resumo/áudio\n"
             "- *status*: mostra progresso e níveis atuais\n"
         )
-        return reply_twiml(msg)
+        return reply_twiml(reply)
 
     if low == "status":
-        msg = (
+        reply = (
             f"👤 Níveis — MAT:{user['levels']['matematica']} | PORT:{user['levels']['portugues']}\n"
             f"📈 Feitas — MAT:{len(user['history']['matematica'])} | "
             f"PORT:{len(user['history']['portugues'])} | LEIT:{len(user['history']['leitura'])}"
         )
-        return reply_twiml(msg)
+        return reply_twiml(reply)
 
     if low == "iniciar":
         plano = build_daily_activity(user)
         meta = get_today_reading_goal(user)
         db["users"][user_id] = user
         save_db(db)
-        # envia tudo em UMA mensagem TwiML para evitar throttling/limites
         msg = (
             "🧩 *Matemática*\n" + plano["matematica"]["enunciado"] + "\n\n"
             "✍️ *Português*\n" + plano["portugues"]["enunciado"] + "\n\n"
