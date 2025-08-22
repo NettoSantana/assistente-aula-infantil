@@ -1,5 +1,5 @@
 # server.py — Assistente de Aula Infantil
-# Onboarding da "MARIA ANGELA" + Programação (seg–sáb, dom opcional, horário)
+# Onboarding da "MARIA ANGELA" + Programação por dia (seg–sáb obrig., dom opcional)
 # + Módulos de Matemática (Soma/Sub/Mult/Div) + fluxo Português/Leitura
 import os, re
 from flask import Flask, request, jsonify, Response
@@ -72,9 +72,19 @@ def age_from_text(txt: str) -> int | None:
     val = int(m.group(1))
     return val if 3 <= val <= 13 else None
 
-# ------------------- Util: rotina (dias/horário) -------------------
+# ------------------- Util: rotina (dias/horário por dia) -------------------
 DEFAULT_DAYS = ["mon","tue","wed","thu","fri","sat"]  # seg–sáb obrigatórios
-DAYS_PT = {"mon":"seg","tue":"ter","wed":"qua","thu":"qui","fri":"sex","sat":"sáb","sun":"dom"}
+DAY_ORDER    = ["mon","tue","wed","thu","fri","sat","sun"]
+DAYS_PT      = {"mon":"seg","tue":"ter","wed":"qua","thu":"qui","fri":"sex","sat":"sáb","sun":"dom"}
+PT2KEY = {
+    "seg":"mon","segunda":"mon",
+    "ter":"tue","terça":"tue","terca":"tue",
+    "qua":"wed","quarta":"wed",
+    "qui":"thu","quinta":"thu",
+    "sex":"fri","sexta":"fri",
+    "sab":"sat","sáb":"sat","sabado":"sat","sábado":"sat",
+    "dom":"sun","domingo":"sun",
+}
 
 def parse_yes_no(txt: str) -> bool | None:
     t = (txt or "").strip().lower()
@@ -101,11 +111,16 @@ def parse_time_hhmm(txt: str) -> str | None:
     if (hh < 5) or (hh > 21) or (hh == 21 and mm > 30): return None
     return f"{hh:02d}:{mm:02d}"
 
-def describe_days(days: list[str]) -> str:
-    ds = [DAYS_PT.get(d,d) for d in days]
-    if days == DEFAULT_DAYS: return "seg–sáb"
-    if days == DEFAULT_DAYS + ["sun"]: return "seg–dom"
-    return ", ".join(ds)
+def describe_schedule(sched: dict) -> str:
+    """Ex.: seg 16:00 | ter 17:00 | ... (somente dias presentes em sched['days'])"""
+    if not sched: return "seg–sáb 19:00"
+    days = [d for d in DAY_ORDER if d in (sched.get("days") or [])]
+    times = sched.get("times") or {}
+    parts = []
+    for d in days:
+        hhmm = times.get(d, "—")
+        parts.append(f"{DAYS_PT.get(d,d)} {hhmm}")
+    return " | ".join(parts)
 
 # ------------------- Matemática: módulos -------------------
 # op: soma | sub | mult | div ; etapa: 1..3
@@ -201,7 +216,10 @@ def needs_onboarding(user) -> bool:
     guardians = prof.get("guardians") or []
     if len(guardians) < 1: return True
     sched = prof.get("schedule") or {}
-    if not sched.get("days") or not sched.get("time"): return True
+    days  = sched.get("days")
+    times = sched.get("times")
+    if not days or not isinstance(days, list): return True
+    if not times or not all(d in times and times[d] for d in days): return True
     return False
 
 def ob_state(user):
@@ -217,8 +235,6 @@ def ob_start() -> str:
 
 def ob_summary(data: dict) -> str:
     sched = data.get("schedule") or {}
-    days = sched.get("days") or DEFAULT_DAYS
-    time = sched.get("time") or "19:00"
     return (
         "Confere? ✅\n"
         f"• *Nome:* {data.get('child_name')}\n"
@@ -226,18 +242,47 @@ def ob_summary(data: dict) -> str:
         f"• *Série:* {data.get('grade')}\n"
         f"• *WhatsApp da criança:* {mask_phone(data.get('child_phone'))}\n"
         f"• *Responsável(is):* {', '.join(mask_phone(p) for p in (data.get('guardians') or []))}\n"
-        f"• *Rotina:* {describe_days(days)} às {time}\n"
+        f"• *Rotina:* {describe_schedule(sched)}\n"
         "Responda *sim* para salvar, ou *não* para ajustar."
     )
+
+def _schedule_init_days(data, include_sun: bool):
+    days = DEFAULT_DAYS.copy()
+    if include_sun: days.append("sun")
+    data.setdefault("schedule", {})
+    data["schedule"]["days"] = days
+    data["schedule"]["times"] = {}
+    data["schedule"]["pending_days"] = days.copy()
+    data["schedule"]["current_day"]  = None
+
+def _prompt_for_next_day_time(data) -> str:
+    pend = data["schedule"]["pending_days"]
+    if not pend:
+        return ob_summary(data)
+    day = pend[0]
+    data["schedule"]["current_day"] = day
+    label = DAYS_PT.get(day, day)
+    return f"Qual *horário* para *{label}*? (ex.: 18:30, 19h, 7 pm) — faixa 05:00–21:30."
+
+def _set_time_for_current_day(data, text: str) -> str | None:
+    hhmm = parse_time_hhmm(text)
+    if not hhmm:
+        return "Horário inválido. Exemplos: *19:00*, *18h30*, *7 pm*. Faixa aceita: 05:00–21:30."
+    day = data["schedule"]["current_day"]
+    data["schedule"]["times"][day] = hhmm
+    # remove da fila
+    data["schedule"]["pending_days"].pop(0)
+    data["schedule"]["current_day"] = None
+    return None
 
 def ob_step(user, text: str) -> str:
     st = ob_state(user)
     step = st.get("step")
     data = st.get("data", {})
-    data.setdefault("schedule", {"days": DEFAULT_DAYS.copy(), "time": "19:00"})
 
-    # Correções diretas por campo
-    m = re.match(r"^\s*(nome|idade|serie|série|crianca|criança|pais|pais/responsaveis|domingo|horario|horário)\s*:\s*(.+)$", text, re.I)
+    # -------- Correções diretas por campo --------
+    # Campos básicos + domingo geral + horário por dia (ex.: "seg: 16:00")
+    m = re.match(r"^\s*(nome|idade|serie|série|crianca|criança|pais|pais/responsaveis|domingo)\s*:\s*(.+)$", text, re.I)
     if m:
         field = m.group(1).lower()
         val = m.group(2).strip()
@@ -258,20 +303,36 @@ def ob_step(user, text: str) -> str:
             a = age_from_text(val)
             if not a: return "Idade inválida. Envie um número entre 3 e 13."
             data["age"] = a
-        elif field in {"domingo"}:
+        elif field == "domingo":
             yn = parse_yes_no(val)
             if yn is None: return "Responda *sim* ou *não* para *domingo:*"
-            days = DEFAULT_DAYS.copy()
-            if yn: days.append("sun")
-            data["schedule"]["days"] = days
-        elif field in {"horario","horário"}:
-            hhmm = parse_time_hhmm(val)
-            if not hhmm: return "Horário inválido. Exemplos válidos: *19:00*, *18h30*, *7 pm*. Faixa aceita: 05:00–21:30."
-            data["schedule"]["time"] = hhmm
+            _schedule_init_days(data, include_sun=yn)
+            st["step"] = "schedule_time"
+            st["data"] = data
+            return _prompt_for_next_day_time(data)
         st["data"] = data
         st["step"] = "confirm"
         return ob_summary(data)
 
+    # Correção direta por dia: "seg: 16:00", "terça: 17:15", etc.
+    md = re.match(r"^\s*(seg|segunda|ter|terça|terca|qua|quarta|qui|quinta|sex|sexta|sab|sáb|sabado|sábado|dom|domingo)\s*:\s*(.+)$", text, re.I)
+    if md:
+        day_key = PT2KEY.get(md.group(1).lower())
+        val = md.group(2).strip()
+        hhmm = parse_time_hhmm(val)
+        if not hhmm: return "Horário inválido. Exemplos: *19:00*, *18h30*, *7 pm*. Faixa 05:00–21:30."
+        data.setdefault("schedule", {})
+        data["schedule"].setdefault("days", DEFAULT_DAYS.copy())
+        data["schedule"].setdefault("times", {})
+        # inclui o dia (caso seja domingo e não estava)
+        if day_key not in data["schedule"]["days"]:
+            data["schedule"]["days"].append(day_key)
+        data["schedule"]["times"][day_key] = hhmm
+        st["data"] = data
+        st["step"] = "confirm"
+        return ob_summary(data)
+
+    # -------- Fluxo normal --------
     if step in (None, "name"):
         st["step"] = "age"
         data["child_name"] = text.strip()
@@ -318,7 +379,7 @@ def ob_step(user, text: str) -> str:
         st["data"]["guardians"] = nums[:2]
         st["step"] = "schedule_sunday"
         return (
-            "Perfeito! 📅 A rotina padrão é *segunda a sábado*.\n"
+            "Perfeito! 📅 A rotina é *segunda a sábado* por padrão.\n"
             "Deseja *incluir domingo* também? (responda *sim* ou *não*)"
         )
 
@@ -326,27 +387,27 @@ def ob_step(user, text: str) -> str:
         yn = parse_yes_no(text)
         if yn is None:
             return "Responda *sim* para incluir domingo, ou *não* para manter seg–sáb."
-        days = DEFAULT_DAYS.copy()
-        if yn: days.append("sun")
-        data["schedule"]["days"] = days
+        _schedule_init_days(data, include_sun=yn)
         st["data"] = data
         st["step"] = "schedule_time"
-        return (
-            "Agora escolha o *horário diário* (recomendado *19:00*).\n"
-            "Envie no formato HH:MM (ex.: *18:30*, *19:00*)."
-        )
+        return _prompt_for_next_day_time(data)
 
     if step == "schedule_time":
-        hhmm = parse_time_hhmm(text)
-        if not hhmm:
-            return "Horário inválido. Exemplos: *19:00*, *18h30*, *7 pm*. Faixa aceita: 05:00–21:30."
-        data["schedule"]["time"] = hhmm
+        # ciclo de coleta por dia
+        if "schedule" not in data or not data["schedule"].get("pending_days"):
+            _schedule_init_days(data, include_sun=("sun" in (data.get("schedule",{}).get("days") or [])))
+        err = _set_time_for_current_day(data, text)
+        if err: return err
+        if data["schedule"]["pending_days"]:
+            return _prompt_for_next_day_time(data)
+        # fim da coleta de horários
         st["data"] = data
         st["step"] = "confirm"
         return ob_summary(data)
 
     if step == "confirm":
-        if text.strip().lower() == "sim":
+        t = text.strip().lower()
+        if t == "sim":
             prof = user.setdefault("profile", {})
             prof["child_name"]  = data.get("child_name")
             prof["age"]         = data.get("age")
@@ -354,21 +415,23 @@ def ob_step(user, text: str) -> str:
             prof["child_phone"] = data.get("child_phone")
             prof["guardians"]   = data.get("guardians", [])
             prof.setdefault("tz", "America/Bahia")
-            prof["schedule"]    = data.get("schedule", {"days": DEFAULT_DAYS, "time":"19:00"})
+            # salva rotina completa
+            sched = data.get("schedule", {})
+            prof["schedule"] = {
+                "days":  [d for d in DAY_ORDER if d in (sched.get("days") or [])],
+                "times": sched.get("times", {})
+            }
             user["onboarding"] = {"step": None, "data": {}}
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
                     "Você pode escolher um *módulo de Matemática* (ex.: *soma 1*, *soma 2*, *sub 1*, *mult 3*, *div 2*), "
                     "ou simplesmente enviar *iniciar*.")
-        elif text.strip().lower() in {"não","nao"}:
-            sched = data.get("schedule") or {}
-            days_desc = describe_days(sched.get("days", DEFAULT_DAYS))
-            hhmm = sched.get("time","19:00")
-            return ("Sem problema! Diga o que deseja corrigir usando:\n"
+        elif t in {"não","nao"}:
+            return ("Sem problema! Você pode corrigir assim:\n"
                     "• *nome:* Ana Souza\n• *idade:* 7\n• *serie:* 2º ano\n"
                     "• *crianca:* +55 71 91234-5678 (ou *não tem*)\n"
                     "• *pais:* +55 71 98888-7777, +55 71 97777-8888\n"
-                    f"• *domingo:* sim/não (atual: { 'incluído' if 'sun' in sched.get('days',[]) else 'não incluído' })\n"
-                    f"• *horario:* HH:MM (atual: {hhmm})")
+                    "• *domingo:* sim/não\n"
+                    "• *seg:* 16:00  • *ter:* 17:00  • *qua:* 18:30  • *qui:* 19:00  • *sex:* 19:00  • *sáb:* 10:00  • *dom:* 16:00")
         else:
             return "Responda *sim* para salvar, ou *não* para ajustar."
 
@@ -426,11 +489,11 @@ def bot_webhook():
     # -------- Comandos gerais --------
     if low in {"menu", "ajuda", "help"}:
         cur = _module_label(user["math_module"]["op"], user["math_module"]["etapa"])
-        sched = user.get("profile", {}).get("schedule", {"days": DEFAULT_DAYS, "time":"19:00"})
+        sched = user.get("profile", {}).get("schedule", {})
         reply = (
             "📚 *Assistente de Aula*\n"
             f"Módulo atual de Matemática: *{cur}*\n"
-            f"🗓️ Rotina: {describe_days(sched.get('days',DEFAULT_DAYS))} às {sched.get('time','19:00')}\n\n"
+            f"🗓️ Rotina: {describe_schedule(sched)}\n\n"
             "Fluxo do dia:\n"
             "1) Matemática (lote com 10 itens — responda por vírgula)\n"
             "2) Português (1 questão)\n"
@@ -446,13 +509,13 @@ def bot_webhook():
 
     if low == "status":
         cur = _module_label(user["math_module"]["op"], user["math_module"]["etapa"])
-        sched = user.get("profile", {}).get("schedule", {"days": DEFAULT_DAYS, "time":"19:00"})
+        sched = user.get("profile", {}).get("schedule", {})
         reply = (
             f"👤 Níveis — MAT:{user['levels']['matematica']} | PORT:{user['levels']['portugues']}\n"
             f"📈 Feitas — MAT:{len(user['history']['matematica'])} | "
             f"PORT:{len(user['history']['portugues'])} | LEIT:{len(user['history']['leitura'])}\n"
             f"🔧 Módulo de Matemática atual: *{cur}*\n"
-            f"🗓️ Rotina: {describe_days(sched.get('days',DEFAULT_DAYS))} às {sched.get('time','19:00')}"
+            f"🗓️ Rotina: {describe_schedule(sched)}"
         )
         return reply_twiml(reply)
 
