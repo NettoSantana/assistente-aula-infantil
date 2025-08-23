@@ -1,7 +1,8 @@
 # server.py — Assistente de Aula Infantil
-# Onboarding da "MARIA ANGELA" + Programação por dia (seg–sáb obrig., dom opcional)
-# + Módulos de Matemática (Soma/Sub/Mult/Div) + fluxo Português/Leitura
-import os, re
+# Onboarding "MARIA ANGELA" + Rotina por dia (seg–sáb obrig., dom opcional)
+# Currículo Matemática fixo (90 dias): Adição → Subtração → Multiplicação → Divisão → Revisões
+# Fluxo: Matemática (lote) → Português (1 questão) → Leitura
+import os, re, itertools
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
 from progress import init_user_if_needed
@@ -122,38 +123,64 @@ def describe_schedule(sched: dict) -> str:
         parts.append(f"{DAYS_PT.get(d,d)} {hhmm}")
     return " | ".join(parts)
 
-# ------------------- Matemática: módulos -------------------
-# op: soma | sub | mult | div ; etapa: 1..3
+# ------------------- Currículo Matemática (90 dias) -------------------
+def _curriculum_spec(day_idx: int):
+    """
+    Retorna um dict com {phase, op, mode, anchor} para o dia (1..90).
+    Fases:
+      A Adição: dias 1–24
+      B Subtração: 25–38
+      C Multiplicação: 39–58
+      D Divisão: 59–74
+      E Revisão/Misto: 75–90
+    """
+    if day_idx < 1: day_idx = 1
+    if day_idx > 90: day_idx = 90
+
+    if 1 <= day_idx <= 10:
+        # Adição direta (âncora 1..10): a+1..a+10
+        return {"phase": "A-Adição", "op": "soma", "mode": "direct", "anchor": day_idx}
+    if 11 <= day_idx <= 20:
+        # Adição invertida (âncora 1..10): 1+a..10+a
+        return {"phase": "A-Adição", "op": "soma", "mode": "inv", "anchor": day_idx - 10}
+    if 21 <= day_idx <= 24:
+        # Completar 10 / misto até 20
+        return {"phase": "A-Adição", "op": "soma", "mode": "mix10", "anchor": None}
+
+    if 25 <= day_idx <= 34:
+        # Subtração: minuendo 11..20 (m-1..m-10)
+        return {"phase": "B-Subtração", "op": "sub", "mode": "minuend", "anchor": day_idx - 14}  # 25->11 ... 34->20
+    if 35 <= day_idx <= 38:
+        # Subtração mista/fato ausente
+        return {"phase": "B-Subtração", "op": "sub", "mode": "mix", "anchor": None}
+
+    if 39 <= day_idx <= 48:
+        # Multiplicação direta (âncora 1..10): a×1..a×10
+        return {"phase": "C-Multiplicação", "op": "mult", "mode": "direct", "anchor": day_idx - 38}
+    if 49 <= day_idx <= 58:
+        # Multiplicação comutativa/variações (âncora 1..10)
+        return {"phase": "C-Multiplicação", "op": "mult", "mode": "commute", "anchor": day_idx - 48}
+
+    if 59 <= day_idx <= 68:
+        # Divisão (divisor 1..10): (d×1)/d .. (d×10)/d
+        return {"phase": "D-Divisão", "op": "div", "mode": "divisor", "anchor": day_idx - 58}
+    if 69 <= day_idx <= 74:
+        # Divisão mista/fato ausente
+        return {"phase": "D-Divisão", "op": "div", "mode": "mix", "anchor": None}
+
+    # 75–90 Revisões / Misto equilibrado
+    return {"phase": "E-Revisão", "op": "mix", "mode": "review", "anchor": None}
+
 def _module_label(op: str, etapa: int) -> str:
-    labels = {"soma":"Soma","sub":"Subtração","mult":"Multiplicação","div":"Divisão"}
-    extra = { "soma": f"+{etapa}", "sub": f"-{etapa}", "mult": f"×{etapa}", "div": f"÷{etapa}" }
+    # (mantido para compatibilidade de formatação)
+    labels = {"soma":"Soma","sub":"Subtração","mult":"Multiplicação","div":"Divisão","mix":"Revisão"}
+    extra = { "soma": f"+{etapa}", "sub": f"-{etapa}", "mult": f"×{etapa}", "div": f"÷{etapa}", "mix": "" }
     return f"{labels.get(op, op.title())} {etapa} ({extra.get(op,'')})"
 
-def _build_math_batch_for(op: str, etapa: int):
-    # Retorna problems (strings) e answers (ints) com 10 itens
-    if op == "soma":
-        problems = [f"{i}+{etapa}" for i in range(1, 11)]
-        answers  = [i + etapa for i in range(1, 11)]
-    elif op == "sub":
-        problems = [f"{i+etapa}-{etapa}" for i in range(1, 11)]
-        answers  = [i for i in range(1, 11)]
-    elif op == "mult":
-        problems = [f"{i}x{etapa}" for i in range(1, 11)]
-        answers  = [i * etapa for i in range(1, 11)]
-    elif op == "div":
-        problems = [f"{i*etapa}/{etapa}" for i in range(1, 11)]
-        answers  = [i for i in range(1, 11)]
-    else:
-        # fallback: soma 1
-        problems = [f"{i}+1" for i in range(1, 11)]
-        answers  = [i + 1 for i in range(1, 11)]
-        op, etapa = "soma", 1
-    return {"op": op, "etapa": etapa, "problems": problems, "answers": answers}
-
 def _format_math_prompt(batch):
-    title = _module_label(batch["op"], batch["etapa"])
+    title = batch.get("title", "Matemática")
     lines = [
-        f"🧩 *Matemática — {title}*",
+        f"🧩 *{title}*",
         "Responda TUDO em uma única mensagem, *separando por vírgulas*.",
         "Ex.: 2,4,6,8,10,12,14,16,18,20",
         ""
@@ -172,6 +199,128 @@ def _parse_csv_numbers(s: str):
             return None
     return nums
 
+# ---------- Geradores de listas conforme spec ----------
+def _gen_add_direct(a: int):
+    problems = [f"{a}+{i}" for i in range(1, 11)]
+    answers  = [a + i for i in range(1, 11)]
+    return problems, answers
+
+def _gen_add_inv(a: int):
+    problems = [f"{i}+{a}" for i in range(1, 11)]
+    answers  = [i + a for i in range(1, 11)]
+    return problems, answers
+
+def _gen_add_mix10():
+    pairs = [(1,9),(2,8),(3,7),(4,6),(5,5),(6,4),(7,3),(8,2),(9,1),(10,0)]
+    problems = [f"{x}+{y}" for x,y in pairs]
+    answers  = [x+y for x,y in pairs]
+    return problems, answers
+
+def _gen_sub_minuend(m: int):
+    problems = [f"{m}-{i}" for i in range(1, 11)]
+    answers  = [m - i for i in range(1, 11)]
+    return problems, answers
+
+def _gen_sub_mix():
+    # mistura fatos 11..20 com faltantes
+    base = list(range(11, 16))  # 11..15
+    problems = []
+    answers  = []
+    for m in base:
+        problems.append(f"{m}-1")
+        answers.append(m-1)
+    # fatos ausentes do tipo "__ + a = b" (resposta é b-a)
+    missing = [(10,7),(12,5),(14,9),(15,8),(18,6)]
+    for total,a in missing:
+        problems.append(f"__+{a}={total}")
+        answers.append(total - a)
+    # completa 10 itens
+    problems = problems[:10]
+    answers  = answers[:10]
+    return problems, answers
+
+def _gen_mult_direct(a: int):
+    problems = [f"{a}x{i}" for i in range(1, 11)]
+    answers  = [a * i for i in range(1, 11)]
+    return problems, answers
+
+def _gen_mult_commute(a: int):
+    # intercala a×i com i×a (1..10)
+    left  = [f"{a}x{i}" for i in range(1, 6)]
+    right = [f"{i}x{a}" for i in range(6, 11)]
+    problems = left + right
+    answers  = [a*i for i in range(1,6)] + [i*a for i in range(6,11)]
+    return problems, answers
+
+def _gen_div_divisor(d: int):
+    # (d×1)/d .. (d×10)/d
+    problems = [f"{d*i}/{d}" for i in range(1, 11)]
+    answers  = [i for i in range(1, 11)]
+    return problems, answers
+
+def _gen_div_mix():
+    # divisões variadas com divisor 2..10
+    divs = [(12,3),(14,7),(16,4),(18,9),(20,5),(21,7),(24,6),(30,5),(32,8),(40,10)]
+    problems = [f"{a}/{b}" for a,b in divs]
+    answers  = [a//b for a,b in divs]
+    return problems, answers
+
+def _gen_review_mix():
+    # 10 itens: 3 adições, 3 subtrações, 2 multiplicações, 2 divisões (determinístico)
+    adds = [(7,3),(8,5),(9,6)]
+    subs = [(15,7),(18,9),(20,11)]
+    mult = [(3,7),(4,6)]
+    divs = [(24,6),(40,10)]
+    problems = [f"{a}+{b}" for a,b in adds] + \
+               [f"{a}-{b}" for a,b in subs] + \
+               [f"{a}x{b}" for a,b in mult] + \
+               [f"{a}/{b}" for a,b in divs]
+    answers  = [a+b for a,b in adds] + \
+               [a-b for a,b in subs] + \
+               [a*b for a,b in mult] + \
+               [a//b for a,b in divs]
+    return problems, answers
+
+def _build_batch_from_spec(spec: dict):
+    phase = spec["phase"]; op = spec["op"]; mode = spec["mode"]; anchor = spec["anchor"]
+    title = f"Matemática — {phase}"
+    if op == "soma":
+        if mode == "direct":
+            p,a = _gen_add_direct(anchor)
+            title += f" · {anchor}+1 … {anchor}+10"
+        elif mode == "inv":
+            p,a = _gen_add_inv(anchor)
+            title += f" · 1+{anchor} … 10+{anchor}"
+        else:
+            p,a = _gen_add_mix10()
+            title += " · completar 10"
+    elif op == "sub":
+        if mode == "minuend":
+            p,a = _gen_sub_minuend(anchor)
+            title += f" · {anchor}-1 … {anchor}-10"
+        else:
+            p,a = _gen_sub_mix()
+            title += " · misto"
+    elif op == "mult":
+        if mode == "direct":
+            p,a = _gen_mult_direct(anchor)
+            title += f" · {anchor}×1 … {anchor}×10"
+        else:
+            p,a = _gen_mult_commute(anchor)
+            title += f" · comutativas de {anchor}"
+    elif op == "div":
+        if mode == "divisor":
+            p,a = _gen_div_divisor(anchor)
+            title += f" · ÷{anchor}"
+        else:
+            p,a = _gen_div_mix()
+            title += " · misto"
+    else:
+        p,a = _gen_review_mix()
+        title += " · revisão"
+
+    return {"problems": p, "answers": a, "title": title, "spec": spec}
+
 def _check_math_batch(user, text: str):
     pend = user.get("pending", {}).get("mat_lote")
     if not pend:
@@ -186,17 +335,23 @@ def _check_math_batch(user, text: str):
     if wrong_idx:
         pos = ", ".join(map(str, wrong_idx))
         return False, f"❌ Algumas respostas estão incorretas nas posições: {pos}. Reenvie a lista completa (ex.: 2,4,6,...)"
-    # sucesso: registra com info do módulo
+    # sucesso: registra com info do currículo
+    spec = pend.get("spec", {})
     user["history"]["matematica"].append({
         "tipo": "lote",
-        "module": {"op": pend["op"], "etapa": pend["etapa"]},
+        "curriculum": spec,
         "problems": pend["problems"],
         "answers": got,
     })
     user["levels"]["matematica"] += 1
+    # avança dia do currículo
+    cur = user.setdefault("curriculum", {"math_day": 1, "total_days": 90})
+    cur["math_day"] = min(90, int(cur.get("math_day",1)) + 1)
+    # limpa pendência
     user["pending"].pop("mat_lote", None)
-    return True, f"✅ Matemática concluída! Nível de Matemática agora: {user['levels']['matematica']}"
+    return True, f"✅ Matemática concluída! Avançando para o *dia {cur['math_day']}* do plano."
 
+# ------------------- Português / Leitura -------------------
 def _start_portugues(user):
     lvl = user["levels"]["portugues"]
     act = portugues_activity(lvl)
@@ -233,19 +388,6 @@ def ob_start() -> str:
         "Pra começar, me diga: *qual é o nome da criança?*"
     )
 
-def ob_summary(data: dict) -> str:
-    sched = data.get("schedule") or {}
-    return (
-        "Confere? ✅\n"
-        f"• *Nome:* {data.get('child_name')}\n"
-        f"• *Idade:* {data.get('age')} anos\n"
-        f"• *Série:* {data.get('grade')}\n"
-        f"• *WhatsApp da criança:* {mask_phone(data.get('child_phone'))}\n"
-        f"• *Responsável(is):* {', '.join(mask_phone(p) for p in (data.get('guardians') or []))}\n"
-        f"• *Rotina:* {describe_schedule(sched)}\n"
-        "Responda *sim* para salvar, ou *não* para ajustar."
-    )
-
 def _schedule_init_days(data, include_sun: bool):
     days = DEFAULT_DAYS.copy()
     if include_sun: days.append("sun")
@@ -275,13 +417,25 @@ def _set_time_for_current_day(data, text: str) -> str | None:
     data["schedule"]["current_day"] = None
     return None
 
+def ob_summary(data: dict) -> str:
+    sched = data.get("schedule") or {}
+    return (
+        "Confere? ✅\n"
+        f"• *Nome:* {data.get('child_name')}\n"
+        f"• *Idade:* {data.get('age')} anos\n"
+        f"• *Série:* {data.get('grade')}\n"
+        f"• *WhatsApp da criança:* {mask_phone(data.get('child_phone'))}\n"
+        f"• *Responsável(is):* {', '.join(mask_phone(p) for p in (data.get('guardians') or []))}\n"
+        f"• *Rotina:* {describe_schedule(sched)}\n"
+        "Responda *sim* para salvar, ou *não* para ajustar."
+    )
+
 def ob_step(user, text: str) -> str:
     st = ob_state(user)
     step = st.get("step")
     data = st.get("data", {})
 
-    # -------- Correções diretas por campo --------
-    # Campos básicos + domingo geral + horário por dia (ex.: "seg: 16:00")
+    # Correções diretas (básicos/domingo e horário por dia tipo "seg: 16:00")
     m = re.match(r"^\s*(nome|idade|serie|série|crianca|criança|pais|pais/responsaveis|domingo)\s*:\s*(.+)$", text, re.I)
     if m:
         field = m.group(1).lower()
@@ -314,7 +468,6 @@ def ob_step(user, text: str) -> str:
         st["step"] = "confirm"
         return ob_summary(data)
 
-    # Correção direta por dia: "seg: 16:00", "terça: 17:15", etc.
     md = re.match(r"^\s*(seg|segunda|ter|terça|terca|qua|quarta|qui|quinta|sex|sexta|sab|sáb|sabado|sábado|dom|domingo)\s*:\s*(.+)$", text, re.I)
     if md:
         day_key = PT2KEY.get(md.group(1).lower())
@@ -324,7 +477,6 @@ def ob_step(user, text: str) -> str:
         data.setdefault("schedule", {})
         data["schedule"].setdefault("days", DEFAULT_DAYS.copy())
         data["schedule"].setdefault("times", {})
-        # inclui o dia (caso seja domingo e não estava)
         if day_key not in data["schedule"]["days"]:
             data["schedule"]["days"].append(day_key)
         data["schedule"]["times"][day_key] = hhmm
@@ -332,7 +484,7 @@ def ob_step(user, text: str) -> str:
         st["step"] = "confirm"
         return ob_summary(data)
 
-    # -------- Fluxo normal --------
+    # Fluxo
     if step in (None, "name"):
         st["step"] = "age"
         data["child_name"] = text.strip()
@@ -393,14 +545,12 @@ def ob_step(user, text: str) -> str:
         return _prompt_for_next_day_time(data)
 
     if step == "schedule_time":
-        # ciclo de coleta por dia
         if "schedule" not in data or not data["schedule"].get("pending_days"):
             _schedule_init_days(data, include_sun=("sun" in (data.get("schedule",{}).get("days") or [])))
         err = _set_time_for_current_day(data, text)
         if err: return err
         if data["schedule"]["pending_days"]:
             return _prompt_for_next_day_time(data)
-        # fim da coleta de horários
         st["data"] = data
         st["step"] = "confirm"
         return ob_summary(data)
@@ -415,16 +565,16 @@ def ob_step(user, text: str) -> str:
             prof["child_phone"] = data.get("child_phone")
             prof["guardians"]   = data.get("guardians", [])
             prof.setdefault("tz", "America/Bahia")
-            # salva rotina completa
             sched = data.get("schedule", {})
             prof["schedule"] = {
                 "days":  [d for d in DAY_ORDER if d in (sched.get("days") or [])],
                 "times": sched.get("times", {})
             }
+            # inicia currículo no dia 1
+            user.setdefault("curriculum", {"math_day": 1, "total_days": 90})
             user["onboarding"] = {"step": None, "data": {}}
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
-                    "Você pode escolher um *módulo de Matemática* (ex.: *soma 1*, *soma 2*, *sub 1*, *mult 3*, *div 2*), "
-                    "ou simplesmente enviar *iniciar*.")
+                    "Envie *iniciar* para começar o *Dia 1* do plano.")
         elif t in {"não","nao"}:
             return ("Sem problema! Você pode corrigir assim:\n"
                     "• *nome:* Ana Souza\n• *idade:* 7\n• *serie:* 2º ano\n"
@@ -443,6 +593,10 @@ def ob_step(user, text: str) -> str:
 def ping():
     return jsonify({"project": PROJECT_NAME, "ok": True}), 200
 
+def _curriculum_phase_title(day_idx: int) -> str:
+    spec = _curriculum_spec(day_idx)
+    return spec["phase"]
+
 @app.route("/bot", methods=["POST"])
 def bot_webhook():
     payload = request.form or request.json or {}
@@ -455,7 +609,7 @@ def bot_webhook():
     user.setdefault("pending", {})
     user.setdefault("profile", {})
     user.setdefault("onboarding", {"step": None, "data": {}})
-    user.setdefault("math_module", {"op": "soma", "etapa": 1})  # padrão: Soma 1
+    user.setdefault("curriculum", {"math_day": 1, "total_days": 90})
 
     # -------- Onboarding primeiro --------
     if needs_onboarding(user):
@@ -468,39 +622,21 @@ def bot_webhook():
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(reply)
 
-    # -------- Seleção de módulo (ex.: "soma 1", "mult 2", "div 3") --------
-    m = re.match(r"^\s*(soma|adi[cç][aã]o|sub|subtra[cç][aã]o|mult|multiplica[cç][aã]o|div|divis[aã]o)\s*(\d)\s*$", low)
-    if m:
-        raw_op = m.group(1)
-        etapa = int(m.group(2))
-        if etapa not in (1,2,3):
-            return reply_twiml("Escolha a *etapa* entre 1, 2 ou 3.")
-        op_map = {
-            "soma":"soma","adição":"soma","adicao":"soma",
-            "sub":"sub","subtração":"sub","subtracao":"sub",
-            "mult":"mult","multiplicação":"mult","multiplicacao":"mult",
-            "div":"div","divisão":"div","divisao":"div",
-        }
-        op = op_map.get(raw_op, "soma")
-        user["math_module"] = {"op": op, "etapa": etapa}
-        db["users"][user_id] = user; save_db(db)
-        return reply_twiml(f"✅ Módulo definido: *{_module_label(op, etapa)}*.\nEnvie *iniciar* para começar.")
-
     # -------- Comandos gerais --------
     if low in {"menu", "ajuda", "help"}:
-        cur = _module_label(user["math_module"]["op"], user["math_module"]["etapa"])
+        day = int(user.get("curriculum",{}).get("math_day",1))
+        phase = _curriculum_phase_title(day)
         sched = user.get("profile", {}).get("schedule", {})
         reply = (
             "📚 *Assistente de Aula*\n"
-            f"Módulo atual de Matemática: *{cur}*\n"
+            f"📆 *Plano Matemática:* Dia {day}/90 — {phase}\n"
             f"🗓️ Rotina: {describe_schedule(sched)}\n\n"
             "Fluxo do dia:\n"
-            "1) Matemática (lote com 10 itens — responda por vírgula)\n"
+            "1) Matemática (10 itens — responda por vírgula)\n"
             "2) Português (1 questão)\n"
             "3) Leitura (meta do dia)\n\n"
             "Comandos:\n"
-            "- *soma 1|2|3*, *sub 1|2|3*, *mult 1|2|3*, *div 1|2|3*\n"
-            "- *iniciar*: começa no módulo atual\n"
+            "- *iniciar*: começa a sessão do dia\n"
             "- *resposta X* ou apenas *X*: responde à etapa atual\n"
             "- *leitura ok*: confirma leitura do dia\n"
             "- *status*: mostra progresso\n"
@@ -508,20 +644,28 @@ def bot_webhook():
         return reply_twiml(reply)
 
     if low == "status":
-        cur = _module_label(user["math_module"]["op"], user["math_module"]["etapa"])
+        day = int(user.get("curriculum",{}).get("math_day",1))
+        phase = _curriculum_phase_title(day)
         sched = user.get("profile", {}).get("schedule", {})
         reply = (
             f"👤 Níveis — MAT:{user['levels']['matematica']} | PORT:{user['levels']['portugues']}\n"
             f"📈 Feitas — MAT:{len(user['history']['matematica'])} | "
             f"PORT:{len(user['history']['portugues'])} | LEIT:{len(user['history']['leitura'])}\n"
-            f"🔧 Módulo de Matemática atual: *{cur}*\n"
+            f"📆 *Plano Matemática:* Dia {day}/90 — {phase}\n"
             f"🗓️ Rotina: {describe_schedule(sched)}"
         )
         return reply_twiml(reply)
 
     if low == "iniciar":
-        op = user["math_module"]["op"]; etapa = user["math_module"]["etapa"]
-        batch = _build_math_batch_for(op, etapa)
+        # Se já há pendência de matemática, reapresenta a lista
+        if "mat_lote" in user.get("pending", {}):
+            batch = user["pending"]["mat_lote"]
+            db["users"][user_id] = user; save_db(db)
+            return reply_twiml(_format_math_prompt(batch))
+        # Gera sessão do dia atual
+        day = int(user.get("curriculum",{}).get("math_day",1))
+        spec = _curriculum_spec(day)
+        batch = _build_batch_from_spec(spec)
         user["pending"]["mat_lote"] = batch
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(_format_math_prompt(batch))
@@ -566,7 +710,7 @@ def bot_webhook():
         return reply_twiml(result_txt)
 
     # 3) Nada pendente
-    return reply_twiml("Digite *iniciar* para começar (ou defina o módulo: ex. *soma 1*).")
+    return reply_twiml("Envie *iniciar* para começar a sessão do dia (Matemática → Português → Leitura).")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
