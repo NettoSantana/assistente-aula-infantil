@@ -627,15 +627,34 @@ def bot_webhook():
             "Para começar a atividade de hoje, envie *iniciar*.\n"
             "Responda os resultados *separados por vírgula* (ex.: 2,4,6,8,...)\n"
             "ou envie *ok* (TESTE) para avançar sem corrigir.\n"
-            "Comandos: *iniciar*, *resposta X*, *ok*, *status*."
+            "Comandos: *iniciar*, *resposta X*, *ok*, *status*, *debug*."
         )
         return reply_twiml(reply)
 
     if low == "status":
-        # Enxuto: apenas Matemática
         reply = (
             f"Nível MAT: {user['levels']['matematica']}\n"
             f"Feitas MAT: {len(user['history']['matematica'])}"
+        )
+        return reply_twiml(reply)
+
+    # -------- Novo: comando debug --------
+    if low == "debug":
+        cur_day = int(user.get("curriculum", {}).get("math_day", 1))
+        pend = user.get("pending", {}).get("mat_lote")
+        pend_flag = "sim" if pend else "não"
+        spec = (pend or {}).get("spec", {}) or {}
+        title = (pend or {}).get("title", "-")
+        phase = spec.get("phase", "-")
+        op    = spec.get("op", "-")
+        mode  = spec.get("mode", "-")
+        anchor= spec.get("anchor", "-")
+        reply = (
+            "🛠 *DEBUG*\n"
+            f"• math_day: {cur_day}\n"
+            f"• pendência: {pend_flag}\n"
+            f"• title: {title}\n"
+            f"• spec: phase={phase} | op={op} | mode={mode} | anchor={anchor}"
         )
         return reply_twiml(reply)
 
@@ -661,6 +680,15 @@ def bot_webhook():
         return reply_twiml("📖 *Leitura* está desativada no momento. Siga com *Matemática*.")
 
     # -------- Respostas do fluxo --------
+    # 0) NOVO: se usuário manda 'ok' sem pendência, cria o lote do dia atual e cai no fluxo abaixo
+    if low in {"ok", "ok!", "ok."} and "mat_lote" not in user.get("pending", {}):
+        day = int(user.get("curriculum",{}).get("math_day",1))
+        spec = _curriculum_spec(day)
+        batch = _build_batch_from_spec(spec)
+        user["pending"]["mat_lote"] = batch
+        db["users"][user_id] = user; save_db(db)
+        # segue para o bloco "mat_lote" usando o mesmo 'ok'
+
     # 1) Matemática (lote CSV ou 'ok' de teste)
     if "mat_lote" in user.get("pending", {}):
         raw = text
