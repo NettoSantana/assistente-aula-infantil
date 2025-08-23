@@ -1,13 +1,11 @@
 # server.py — Assistente de Aula Infantil
 # Onboarding "MARIA ANGELA" + Rotina por dia (seg–sáb obrig., dom opcional)
 # Currículo Matemática fixo (90 dias): Adição → Subtração → Multiplicação → Divisão → Revisões
-# Fluxo: Matemática (lote) → Português (1 questão) → Leitura
+# Fluxo ATUAL: apenas Matemática (Português e Leitura TEMPORARIAMENTE desativados)
 import os, re, itertools
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
 from progress import init_user_if_needed
-from leitura import get_today_reading_goal, check_reading_submission
-from activities import portugues_activity, check_answer  # português (1 questão)
 
 # Twilio — resposta imediata
 from twilio.twiml.messaging_response import MessagingResponse
@@ -22,6 +20,10 @@ TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM  = os.getenv("TWILIO_FROM", "")
 _twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
+
+# ------------------- Flags de módulos -------------------
+FEATURE_PORTUGUES = False
+FEATURE_LEITURA   = False
 
 # ------------------- Util: TwiML -------------------
 def reply_twiml(text: str) -> Response:
@@ -336,16 +338,12 @@ def _check_math_batch(user, text: str):
     user["pending"].pop("mat_lote", None)
     return True, f"✅ Matemática concluída! Avançando para o *dia {cur['math_day']}* do plano."
 
-# ------------------- Português / Leitura -------------------
+# ------------------- Stubs para módulos desativados -------------------
 def _start_portugues(user):
-    lvl = user["levels"]["portugues"]
-    act = portugues_activity(lvl)
-    user["pending"]["portugues"] = act.__dict__
-    return "✍️ *Português*\n" + act.enunciado
+    return "✍️ *Português* está temporariamente desativado."
 
 def _start_leitura(user):
-    meta = get_today_reading_goal(user)
-    return f"📖 *Leitura* — {meta}"
+    return "📖 *Leitura* está temporariamente desativada."
 
 # ------------------- Onboarding (MARIA ANGELA) -------------------
 def needs_onboarding(user) -> bool:
@@ -369,7 +367,7 @@ def ob_state(user):
 def ob_start() -> str:
     return (
         "Oi! Eu sou a *MARIA ANGELA* 🌟 sua assistente de aula.\n"
-        "Vou te acompanhar em atividades de *Matemática, Português e Leitura*.\n\n"
+        "Vou te acompanhar em atividades de *Matemática*.\n\n"
         "Pra começar, me diga: *qual é o nome da criança?*"
     )
 
@@ -610,15 +608,15 @@ def bot_webhook():
         reply = (
             "Para começar a atividade de hoje, envie *iniciar*.\n"
             "Responda os resultados *separados por vírgula* (ex.: 2,4,6,8,...).\n"
-            "Comandos: *iniciar*, *resposta X*, *leitura ok*, *status*."
+            "Comandos: *iniciar*, *resposta X*, *status*."
         )
         return reply_twiml(reply)
 
     if low == "status":
+        # Enxuto: apenas Matemática
         reply = (
-            f"Níveis — MAT:{user['levels']['matematica']} | PORT:{user['levels']['portugues']}\n"
-            f"Feitas — MAT:{len(user['history']['matematica'])} | "
-            f"PORT:{len(user['history']['portugues'])} | LEIT:{len(user['history']['leitura'])}"
+            f"Nível MAT: {user['levels']['matematica']}\n"
+            f"Feitas MAT: {len(user['history']['matematica'])}"
         )
         return reply_twiml(reply)
 
@@ -639,9 +637,9 @@ def bot_webhook():
         return reply_twiml(saudacao + "\n\n" + _format_math_prompt(batch))
 
     if low.startswith("leitura ok"):
-        ok, msg = check_reading_submission(user)
+        # Leitura desativada
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml(msg)
+        return reply_twiml("📖 *Leitura* está desativada no momento. Siga com *Matemática*.")
 
     # -------- Respostas do fluxo --------
     # 1) Matemática (lote CSV)
@@ -656,29 +654,26 @@ def bot_webhook():
         if not ok:
             db["users"][user_id] = user; save_db(db)
             return reply_twiml(msg)
-        # sucesso → Português
-        port_msg = _start_portugues(user)
+        # sucesso → Próximo LOTE de Matemática automaticamente
+        next_day = int(user.get("curriculum",{}).get("math_day",1))
+        spec2 = _curriculum_spec(next_day)
+        batch2 = _build_batch_from_spec(spec2)
+        user["pending"]["mat_lote"] = batch2
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml(msg + "\n\n" + port_msg)
+        parabens = "🎉 *Parabéns!* Você concluiu o lote de hoje."
+        avancar = f"{msg}"
+        proximo = _format_math_prompt(batch2)
+        return reply_twiml(parabens + "\n" + avancar + "\n\n" + proximo)
 
-    # 2) Português (1 questão)
+    # 2) Guardas antigos: Português/Leitura (não devem ser acionados)
     if "portugues" in user.get("pending", {}):
-        ans = text
-        if low.startswith("resposta"):
-            after = text[len("resposta"):].strip()
-            if not after and " " in text:
-                after = text.split(" ", 1)[1].strip()
-            ans = (after.lstrip(":.-").strip() or after or ans)
-        result_txt = check_answer(user, ans)
-        if "portugues" not in user.get("pending", {}):
-            leitura_msg = _start_leitura(user)
-            db["users"][user_id] = user; save_db(db)
-            return reply_twiml(result_txt + "\n\n" + leitura_msg)
+        # Módulo desativado
+        user["pending"].pop("portugues", None)
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml(result_txt)
+        return reply_twiml("✍️ *Português* está desativado no momento. Continuaremos com *Matemática*.")
 
     # 3) Nada pendente
-    return reply_twiml("Envie *iniciar* para começar a sessão do dia (Matemática → Português → Leitura).")
+    return reply_twiml("Envie *iniciar* para começar a sessão do dia (*Matemática*).")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
