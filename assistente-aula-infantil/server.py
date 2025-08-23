@@ -73,6 +73,11 @@ def age_from_text(txt: str) -> int | None:
     val = int(m.group(1))
     return val if 3 <= val <= 13 else None
 
+# ------------------- Saudação (nome da criança) -------------------
+def first_name_from_profile(user) -> str:
+    name = (user.get("profile", {}).get("child_name") or "").strip()
+    return name.split()[0] if name else "aluno"
+
 # ------------------- Util: rotina (dias/horário por dia) -------------------
 DEFAULT_DAYS = ["mon","tue","wed","thu","fri","sat"]  # seg–sáb obrigatórios
 DAY_ORDER    = ["mon","tue","wed","thu","fri","sat","sun"]
@@ -138,41 +143,30 @@ def _curriculum_spec(day_idx: int):
     if day_idx > 90: day_idx = 90
 
     if 1 <= day_idx <= 10:
-        # Adição direta (âncora 1..10): a+1..a+10
         return {"phase": "A-Adição", "op": "soma", "mode": "direct", "anchor": day_idx}
     if 11 <= day_idx <= 20:
-        # Adição invertida (âncora 1..10): 1+a..10+a
         return {"phase": "A-Adição", "op": "soma", "mode": "inv", "anchor": day_idx - 10}
     if 21 <= day_idx <= 24:
-        # Completar 10 / misto até 20
         return {"phase": "A-Adição", "op": "soma", "mode": "mix10", "anchor": None}
 
     if 25 <= day_idx <= 34:
-        # Subtração: minuendo 11..20 (m-1..m-10)
-        return {"phase": "B-Subtração", "op": "sub", "mode": "minuend", "anchor": day_idx - 14}  # 25->11 ... 34->20
+        return {"phase": "B-Subtração", "op": "sub", "mode": "minuend", "anchor": day_idx - 14}
     if 35 <= day_idx <= 38:
-        # Subtração mista/fato ausente
         return {"phase": "B-Subtração", "op": "sub", "mode": "mix", "anchor": None}
 
     if 39 <= day_idx <= 48:
-        # Multiplicação direta (âncora 1..10): a×1..a×10
         return {"phase": "C-Multiplicação", "op": "mult", "mode": "direct", "anchor": day_idx - 38}
     if 49 <= day_idx <= 58:
-        # Multiplicação comutativa/variações (âncora 1..10)
         return {"phase": "C-Multiplicação", "op": "mult", "mode": "commute", "anchor": day_idx - 48}
 
     if 59 <= day_idx <= 68:
-        # Divisão (divisor 1..10): (d×1)/d .. (d×10)/d
         return {"phase": "D-Divisão", "op": "div", "mode": "divisor", "anchor": day_idx - 58}
     if 69 <= day_idx <= 74:
-        # Divisão mista/fato ausente
         return {"phase": "D-Divisão", "op": "div", "mode": "mix", "anchor": None}
 
-    # 75–90 Revisões / Misto equilibrado
     return {"phase": "E-Revisão", "op": "mix", "mode": "review", "anchor": None}
 
 def _module_label(op: str, etapa: int) -> str:
-    # (mantido para compatibilidade de formatação)
     labels = {"soma":"Soma","sub":"Subtração","mult":"Multiplicação","div":"Divisão","mix":"Revisão"}
     extra = { "soma": f"+{etapa}", "sub": f"-{etapa}", "mult": f"×{etapa}", "div": f"÷{etapa}", "mix": "" }
     return f"{labels.get(op, op.title())} {etapa} ({extra.get(op,'')})"
@@ -222,19 +216,16 @@ def _gen_sub_minuend(m: int):
     return problems, answers
 
 def _gen_sub_mix():
-    # mistura fatos 11..20 com faltantes
-    base = list(range(11, 16))  # 11..15
+    base = list(range(11, 16))
     problems = []
     answers  = []
     for m in base:
         problems.append(f"{m}-1")
         answers.append(m-1)
-    # fatos ausentes do tipo "__ + a = b" (resposta é b-a)
     missing = [(10,7),(12,5),(14,9),(15,8),(18,6)]
     for total,a in missing:
         problems.append(f"__+{a}={total}")
         answers.append(total - a)
-    # completa 10 itens
     problems = problems[:10]
     answers  = answers[:10]
     return problems, answers
@@ -245,7 +236,6 @@ def _gen_mult_direct(a: int):
     return problems, answers
 
 def _gen_mult_commute(a: int):
-    # intercala a×i com i×a (1..10)
     left  = [f"{a}x{i}" for i in range(1, 6)]
     right = [f"{i}x{a}" for i in range(6, 11)]
     problems = left + right
@@ -253,20 +243,17 @@ def _gen_mult_commute(a: int):
     return problems, answers
 
 def _gen_div_divisor(d: int):
-    # (d×1)/d .. (d×10)/d
     problems = [f"{d*i}/{d}" for i in range(1, 11)]
     answers  = [i for i in range(1, 11)]
     return problems, answers
 
 def _gen_div_mix():
-    # divisões variadas com divisor 2..10
     divs = [(12,3),(14,7),(16,4),(18,9),(20,5),(21,7),(24,6),(30,5),(32,8),(40,10)]
     problems = [f"{a}/{b}" for a,b in divs]
     answers  = [a//b for a,b in divs]
     return problems, answers
 
 def _gen_review_mix():
-    # 10 itens: 3 adições, 3 subtrações, 2 multiplicações, 2 divisões (determinístico)
     adds = [(7,3),(8,5),(9,6)]
     subs = [(15,7),(18,9),(20,11)]
     mult = [(3,7),(4,6)]
@@ -344,10 +331,8 @@ def _check_math_batch(user, text: str):
         "answers": got,
     })
     user["levels"]["matematica"] += 1
-    # avança dia do currículo
     cur = user.setdefault("curriculum", {"math_day": 1, "total_days": 90})
     cur["math_day"] = min(90, int(cur.get("math_day",1)) + 1)
-    # limpa pendência
     user["pending"].pop("mat_lote", None)
     return True, f"✅ Matemática concluída! Avançando para o *dia {cur['math_day']}* do plano."
 
@@ -412,7 +397,6 @@ def _set_time_for_current_day(data, text: str) -> str | None:
         return "Horário inválido. Exemplos: *19:00*, *18h30*, *7 pm*. Faixa aceita: 05:00–21:30."
     day = data["schedule"]["current_day"]
     data["schedule"]["times"][day] = hhmm
-    # remove da fila
     data["schedule"]["pending_days"].pop(0)
     data["schedule"]["current_day"] = None
     return None
@@ -570,7 +554,6 @@ def ob_step(user, text: str) -> str:
                 "days":  [d for d in DAY_ORDER if d in (sched.get("days") or [])],
                 "times": sched.get("times", {})
             }
-            # inicia currículo no dia 1
             user.setdefault("curriculum", {"math_day": 1, "total_days": 90})
             user["onboarding"] = {"step": None, "data": {}}
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
@@ -622,53 +605,38 @@ def bot_webhook():
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(reply)
 
-    # -------- Comandos gerais --------
+    # -------- Comandos gerais (MINIMALISTAS) --------
     if low in {"menu", "ajuda", "help"}:
-        day = int(user.get("curriculum",{}).get("math_day",1))
-        phase = _curriculum_phase_title(day)
-        sched = user.get("profile", {}).get("schedule", {})
         reply = (
-            "📚 *Assistente de Aula*\n"
-            f"📆 *Plano Matemática:* Dia {day}/90 — {phase}\n"
-            f"🗓️ Rotina: {describe_schedule(sched)}\n\n"
-            "Fluxo do dia:\n"
-            "1) Matemática (10 itens — responda por vírgula)\n"
-            "2) Português (1 questão)\n"
-            "3) Leitura (meta do dia)\n\n"
-            "Comandos:\n"
-            "- *iniciar*: começa a sessão do dia\n"
-            "- *resposta X* ou apenas *X*: responde à etapa atual\n"
-            "- *leitura ok*: confirma leitura do dia\n"
-            "- *status*: mostra progresso\n"
+            "Para começar a atividade de hoje, envie *iniciar*.\n"
+            "Responda os resultados *separados por vírgula* (ex.: 2,4,6,8,...).\n"
+            "Comandos: *iniciar*, *resposta X*, *leitura ok*, *status*."
         )
         return reply_twiml(reply)
 
     if low == "status":
-        day = int(user.get("curriculum",{}).get("math_day",1))
-        phase = _curriculum_phase_title(day)
-        sched = user.get("profile", {}).get("schedule", {})
         reply = (
-            f"👤 Níveis — MAT:{user['levels']['matematica']} | PORT:{user['levels']['portugues']}\n"
-            f"📈 Feitas — MAT:{len(user['history']['matematica'])} | "
-            f"PORT:{len(user['history']['portugues'])} | LEIT:{len(user['history']['leitura'])}\n"
-            f"📆 *Plano Matemática:* Dia {day}/90 — {phase}\n"
-            f"🗓️ Rotina: {describe_schedule(sched)}"
+            f"Níveis — MAT:{user['levels']['matematica']} | PORT:{user['levels']['portugues']}\n"
+            f"Feitas — MAT:{len(user['history']['matematica'])} | "
+            f"PORT:{len(user['history']['portugues'])} | LEIT:{len(user['history']['leitura'])}"
         )
         return reply_twiml(reply)
 
     if low == "iniciar":
-        # Se já há pendência de matemática, reapresenta a lista
+        # Se já há pendência de matemática, reapresenta a lista (sem repetir saudação)
         if "mat_lote" in user.get("pending", {}):
             batch = user["pending"]["mat_lote"]
             db["users"][user_id] = user; save_db(db)
             return reply_twiml(_format_math_prompt(batch))
-        # Gera sessão do dia atual
+        # Gera sessão do dia atual + saudação personalizada
         day = int(user.get("curriculum",{}).get("math_day",1))
         spec = _curriculum_spec(day)
         batch = _build_batch_from_spec(spec)
         user["pending"]["mat_lote"] = batch
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml(_format_math_prompt(batch))
+        nome = first_name_from_profile(user)
+        saudacao = f"Olá, {nome}! Iremos iniciar nossas atividades de hoje. 👋"
+        return reply_twiml(saudacao + "\n\n" + _format_math_prompt(batch))
 
     if low.startswith("leitura ok"):
         ok, msg = check_reading_submission(user)
@@ -693,7 +661,7 @@ def bot_webhook():
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg + "\n\n" + port_msg)
 
-    # 2) Português (1 questão) — aceita "resposta X" OU só "X"
+    # 2) Português (1 questão)
     if "portugues" in user.get("pending", {}):
         ans = text
         if low.startswith("resposta"):
