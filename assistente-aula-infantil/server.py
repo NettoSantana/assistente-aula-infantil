@@ -289,6 +289,10 @@ def _build_batch_from_spec(spec: dict):
         p,a = _gen_review_mix();             title += " · revisão"
     return {"problems": p, "answers": a, "title": title, "spec": spec}
 
+# ---------- Timer persistente por dia/rodada ----------
+def _timer_key(day: int, round_idx: int) -> str:
+    return f"day{day}_round{round_idx}"
+
 def _apply_round_variation(batch: dict, round_idx: int):
     """Varia ordem determinística por rodada (rotaciona)."""
     p = batch["problems"][:]; a = batch["answers"][:]
@@ -303,15 +307,28 @@ def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
     day = max(1, min(MAX_MATH_DAY, int(day)))
     spec = _curriculum_spec(day)
     batch = _build_batch_from_spec(spec)
+    batch["day"] = day
     batch["round"] = round_idx
     batch["rounds_total"] = ROUNDS_PER_DAY
-    batch["started_at"] = int(time.time())
+
+    # timer persistente
+    timers = user.setdefault("timers", {})
+    key = _timer_key(day, round_idx)
+    started = int(timers.get(key) or time.time())
+    timers[key] = started
+    batch["started_at"] = started
+
     _apply_round_variation(batch, round_idx)
     user["pending"]["mat_lote"] = batch
     return batch
 
-def _check_timegate(pend) -> tuple[bool, str]:
-    started = int(pend.get("started_at") or time.time())
+def _check_timegate(user, pend) -> tuple[bool, str]:
+    day  = int(pend.get("day") or user.get("curriculum",{}).get("math_day",1))
+    r_ix = int(pend.get("round", 1))
+    key  = _timer_key(day, r_ix)
+    timers = user.setdefault("timers", {})
+    started = int(timers.get(key) or pend.get("started_at") or time.time())
+    timers[key] = started  # garante persistência
     elapsed = int(time.time()) - started
     remaining = max(0, MIN_SECONDS - elapsed)
     if remaining > 0:
@@ -320,13 +337,14 @@ def _check_timegate(pend) -> tuple[bool, str]:
         return False, f"⏱️ Ainda faltam {mins}m{secs:02d}s para concluir esta rodada."
     return True, ""
 
+# ------------------- Correção / avanço -------------------
 def _check_math_batch(user, text: str):
     pend = user.get("pending", {}).get("mat_lote")
     if not pend:
         return False, "Nenhum lote de Matemática pendente."
 
     # Bloqueio por tempo (vale para 'ok' e CSV)
-    ok_time, msg_time = _check_timegate(pend)
+    ok_time, msg_time = _check_timegate(user, pend)
     if not ok_time:
         return False, msg_time
 
@@ -336,7 +354,7 @@ def _check_math_batch(user, text: str):
         user["history"]["matematica"].append({
             "tipo": "lote", "curriculum": spec,
             "problems": pend["problems"], "answers": pend["answers"],
-            "bypass": "ok"
+            "bypass": "ok", "round": pend.get("round"), "day": pend.get("day"),
         })
     else:
         expected = pend["answers"]
@@ -353,12 +371,16 @@ def _check_math_batch(user, text: str):
         user["history"]["matematica"].append({
             "tipo": "lote", "curriculum": spec,
             "problems": pend["problems"], "answers": got,
+            "round": pend.get("round"), "day": pend.get("day"),
         })
 
     # Avança rodada/dia
     round_idx = int(pend.get("round", 1))
     rounds_total = int(pend.get("rounds_total", ROUNDS_PER_DAY))
     day = int(user.get("curriculum",{}).get("math_day",1))
+
+    # limpa timer da rodada concluída
+    user.setdefault("timers", {}).pop(_timer_key(day, round_idx), None)
 
     user["pending"].pop("mat_lote", None)
 
@@ -603,6 +625,7 @@ def bot_webhook():
     user.setdefault("profile", {})
     user.setdefault("onboarding", {"step": None, "data": {}})
     user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
+    user.setdefault("timers", {})  # <<< timers persistentes
 
     # -------- Onboarding primeiro --------
     if needs_onboarding(user):
@@ -645,13 +668,20 @@ def bot_webhook():
         title = (pend or {}).get("title", "-")
         phase = spec.get("phase", "-"); op = spec.get("op", "-")
         mode  = spec.get("mode", "-");  anchor = spec.get("anchor", "-")
-        started = (pend or {}).get("started_at")
-        elapsed = (int(time.time()) - int(started)) if started else "-"
+        # usa timer persistente
+        if pend:
+            key = _timer_key(pend.get("day", cur_day), pend.get("round", 1))
+            started = user.get("timers", {}).get(key, (pend or {}).get("started_at"))
+            elapsed = (int(time.time()) - int(started)) if started else "-"
+            round_str = f"{pend.get('round','-')}/{pend.get('rounds_total','-')}"
+        else:
+            key = "-"; started = "-"; elapsed = "-"; round_str = "-"
         reply = (
             "🛠 *DEBUG*\n"
             f"• math_day: {cur_day}/{MAX_MATH_DAY}\n"
             f"• pendência: {pend_flag}\n"
-            f"• round: {(pend or {}).get('round','-')}/{(pend or {}).get('rounds_total','-')}\n"
+            f"• round: {round_str}\n"
+            f"• timer_key: {key}\n"
             f"• elapsed(s): {elapsed}\n"
             f"• title: {title}\n"
             f"• spec: phase={phase} | op={op} | mode={mode} | anchor={anchor}"
@@ -661,6 +691,7 @@ def bot_webhook():
     if low in {"reiniciar", "zerar"}:
         user["curriculum"] = {"math_day": 1, "total_days": MAX_MATH_DAY}
         user["pending"].pop("mat_lote", None)
+        user["timers"].clear()
         db["users"][user_id] = user; save_db(db)
         return reply_twiml("🔁 Plano reiniciado. Envie *iniciar* para começar do *Dia 1* (Rodada 1).")
 
@@ -674,7 +705,7 @@ def bot_webhook():
         day = int(user.get("curriculum",{}).get("math_day",1))
         if day > MAX_MATH_DAY:
             return reply_twiml("✅ Você já concluiu o plano até o *dia 60*. Envie *reiniciar* para começar de novo.")
-        # cria rodada 1
+        # cria rodada 1 (com timer persistente)
         batch = _start_math_batch_for_day(user, day, 1)
         db["users"][user_id] = user; save_db(db)
         nome = first_name_from_profile(user)
@@ -702,7 +733,7 @@ def bot_webhook():
             raw = raw.lstrip(":.-").strip() or raw
         ok_flag, msg = _check_math_batch(user, raw)
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml(msg if ok_flag else msg)
+        return reply_twiml(msg)
 
     if "portugues" in user.get("pending", {}):
         user["pending"].pop("portugues", None)
