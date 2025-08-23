@@ -314,6 +314,23 @@ def _check_math_batch(user, text: str):
     pend = user.get("pending", {}).get("mat_lote")
     if not pend:
         return False, "Nenhum lote de Matemática pendente."
+    # ---- MODO TESTE: aceitar 'ok' para pular correção ----
+    raw = (text or "").strip().lower()
+    if raw in {"ok", "ok!", "ok."}:
+        spec = pend.get("spec", {})
+        user["history"]["matematica"].append({
+            "tipo": "lote",
+            "curriculum": spec,
+            "problems": pend["problems"],
+            "answers": pend["answers"],   # registra gabarito esperado
+            "bypass": "ok"                # marca que foi conclusão por teste
+        })
+        user["levels"]["matematica"] += 1
+        cur = user.setdefault("curriculum", {"math_day": 1, "total_days": 90})
+        cur["math_day"] = min(90, int(cur.get("math_day",1)) + 1)
+        user["pending"].pop("mat_lote", None)
+        return True, f"✅ Matemática concluída! Avançando para o *dia {cur['math_day']}* do plano."
+    # ---- Fluxo normal: CSV de números ----
     expected = pend["answers"]
     got = _parse_csv_numbers(text)
     if got is None:
@@ -482,7 +499,8 @@ def ob_step(user, text: str) -> str:
         return (
             "E em qual *série/ano* ela está?\n"
             "Escolha ou escreva:\n"
-            "• Infantil 4 (Pré-I)\n• Infantil 5 (Pré-II)\n• 1º ano • 2º ano • 3º ano • 4º ano • 5º ano"
+            "• Infantil 4 (Pré-I)\n• Infantil 5 (Pré-II)\n"
+            "• 1º ano • 2º ano • 3º ano • 4º ano • 5º ano"
         )
 
     if step == "grade":
@@ -607,8 +625,9 @@ def bot_webhook():
     if low in {"menu", "ajuda", "help"}:
         reply = (
             "Para começar a atividade de hoje, envie *iniciar*.\n"
-            "Responda os resultados *separados por vírgula* (ex.: 2,4,6,8,...).\n"
-            "Comandos: *iniciar*, *resposta X*, *status*."
+            "Responda os resultados *separados por vírgula* (ex.: 2,4,6,8,...)\n"
+            "ou envie *ok* (TESTE) para avançar sem corrigir.\n"
+            "Comandos: *iniciar*, *resposta X*, *ok*, *status*."
         )
         return reply_twiml(reply)
 
@@ -642,7 +661,7 @@ def bot_webhook():
         return reply_twiml("📖 *Leitura* está desativada no momento. Siga com *Matemática*.")
 
     # -------- Respostas do fluxo --------
-    # 1) Matemática (lote CSV)
+    # 1) Matemática (lote CSV ou 'ok' de teste)
     if "mat_lote" in user.get("pending", {}):
         raw = text
         if low.startswith("resposta"):
