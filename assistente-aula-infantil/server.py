@@ -1,7 +1,6 @@
 # server.py — Assistente de Aula Infantil
 # Onboarding "MARIA ANGELA" + Rotina por dia (seg–sáb obrig., dom opcional)
-# Currículo Matemática fixo (ATÉ 60 dias): Adição → Subtração → Multiplicação → (início de) Divisão
-# Fluxo ATUAL: apenas Matemática (Português e Leitura TEMPORARIAMENTE desativados)
+# Fluxo: Matemática + Português (Leitura TEMPORARIAMENTE desativada)
 import os, re, itertools
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
@@ -22,11 +21,12 @@ TWILIO_FROM  = os.getenv("TWILIO_FROM", "")
 _twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
 
 # ------------------- Flags / Config -------------------
-FEATURE_PORTUGUES = False
+FEATURE_PORTUGUES = True
 FEATURE_LEITURA   = False
 
-MAX_MATH_DAY      = 60                               # limite do plano
-ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))    # 5 rodadas por dia, 10 exercícios cada
+MAX_MATH_DAY      = 60                                 # limite do plano de Matemática
+MAX_PT_DAY        = 60                                 # limite do plano de Português
+ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))      # 5 rodadas por dia, 10 exercícios cada
 
 # ------------------- Util: TwiML -------------------
 def reply_twiml(text: str) -> Response:
@@ -126,16 +126,16 @@ def describe_schedule(sched: dict) -> str:
         parts.append(f"{DAYS_PT.get(d,d)} {hhmm}")
     return " | ".join(parts)
 
-# ------------------- Currículo Matemática (ATÉ 60) -------------------
+# ============================================================
+# =================== MATEMÁTICA (progressivo) ===============
+# ============================================================
 def _curriculum_spec(day_idx: int):
     """
     Retorna {phase, op, mode, anchor} para o dia [1..60].
-    (A lógica de rounds agora força: soma → sub → mult → div → mista.)
+    (Roteiro final por rodada decide: soma → sub → mult → div → mista.)
     """
     if day_idx < 1: day_idx = 1
     if day_idx > MAX_MATH_DAY: day_idx = MAX_MATH_DAY
-
-    # fase "original" não importa muito, pois o round decide a operação do dia
     return {"phase": "A-Adição", "op": "soma", "mode": "direct", "anchor": day_idx}
 
 def _module_label(op: str, etapa: int) -> str:
@@ -143,18 +143,7 @@ def _module_label(op: str, etapa: int) -> str:
     extra = { "soma": f"+{etapa}", "sub": f"-{etapa}", "mult": f"×{etapa}", "div": f"÷{etapa}", "mix": "" }
     return f"{labels.get(op, op.title())} {etapa} ({extra.get(op,'')})"
 
-# ---------- Modelos/variedade (ADIÇÃO) ----------
-ADD_MODEL_TITLES = {
-    "direct_shuffled": "Direta (embaralhada)",
-}
-
-def _models_for_day(op: str, day: int):
-    # Só usamos modelo na rodada 1 (adição) — uma variação sutil.
-    if op != "soma":
-        return None
-    return ["direct_shuffled", None, None, None, None]
-
-# ---------- Enunciado ----------
+# ---------- Enunciado (comum) ----------
 def _format_math_prompt(batch):
     title = batch.get("title", "Matemática")
     round_i = batch.get("round", 1)
@@ -183,7 +172,7 @@ def _parse_csv_numbers(s: str):
             return None
     return nums
 
-# ---------- Geradores base ----------
+# ---------- Geradores base (Matemática) ----------
 def _gen_add_direct(a: int):
     problems = [f"{a}+{i}" for i in range(1, 11)]
     answers  = [a + i for i in range(1, 11)]
@@ -240,31 +229,11 @@ def _gen_div_mix():
     answers  = [a//b for a,b in divs]
     return problems, answers
 
-def _gen_review_mix():
-    adds = [(7,3),(8,5),(9,6)]
-    subs = [(15,7),(18,9),(20,11)]
-    mult = [(3,7),(4,6)]
-    divs = [(24,6),(40,10)]
-    problems = [f"{a}+{b}" for a,b in adds] + \
-               [f"{a}-{b}" for a,b in subs] + \
-               [f"{a}x{b}" for a,b in mult] + \
-               [f"{a}/{b}" for a,b in divs]
-    answers  = [a+b for a,b in adds] + \
-               [a-b for a,b in subs] + \
-               [a*b for a,b in mult] + \
-               [a//b for a,b in divs]
-    return problems, answers
-
-# ---------- MISTA dinâmica pela âncora ----------
 def _gen_review_for_anchor(k: int):
     k = max(1, int(k))
-    # 3 adições
     adds = [(k,3),(k+1,2),(k+2,1)]
-    # 3 subtrações com minuend seguro
     subs = [(min(20, k+10), 1),(min(20, k+10), 2),(min(20, k+10), 3)]
-    # 2 multiplicações
     mult = [(k,2),(k,3)]
-    # 2 divisões
     divs = [(k*2,k),(k*3,k)]
     problems = [f"{a}+{b}" for a,b in adds] + \
                [f"{a}-{b}" for a,b in subs] + \
@@ -276,56 +245,9 @@ def _gen_review_for_anchor(k: int):
                [a//b for a,b in divs]
     return problems, answers
 
-# ---------- Geradores especiais (ADIÇÃO) ----------
-def _gen_add_direct_shuffled(anchor: int, mode: str):
-    if mode == "inv":
-        probs, ans = _gen_add_inv(anchor)
-    else:
-        probs, ans = _gen_add_direct(anchor)
-    return probs, ans
-
-def _gen_add_missing_to_10():
-    problems = [f"__+{a}=10" for a in range(1, 11)]
-    answers  = [10 - a for a in range(1, 11)]
-    return problems, answers
-
-def _gen_add_missing_anchor(anchor: int):
-    targets = [anchor + i for i in range(5, 15)]
-    problems = [f"__+{anchor}={t}" for t in targets]
-    answers  = [t - anchor for t in targets]
-    return problems, answers
-
-def _gen_add_near_doubles():
-    pairs = [(4,7),(6,6),(5,8),(7,7),(8,5),(9,4),(5,6),(8,3),(7,6),(6,9)]
-    problems = [f"{a}+{b}" for a,b in pairs]
-    answers  = [a+b for a,b in pairs]
-    return problems, answers
-
-def _gen_add_sort_results_set():
-    pairs = [(7,3),(5,6),(3,9),(8,2),(4,8),(6,5),(4,7),(9,1),(5,5),(2,9)]
-    problems = [f"{a}+{b}" for a,b in pairs]
-    sums     = [a+b for a,b in pairs]
-    answers  = sorted(sums)
-    return problems, answers
-
-# ---------- Build do lote ----------
+# ---------- Build do lote (Matemática) ----------
 def _build_batch_from_spec(spec: dict, *, model: str | None = None):
     phase = spec["phase"]; op = spec["op"]; mode = spec["mode"]; anchor = spec["anchor"]
-
-    # Adição com modelo leve
-    if op == "soma" and model:
-        title = f"Matemática — {phase} · {ADD_MODEL_TITLES.get(model, model)}"
-        prompt_hint = "Some e responda *os 10 resultados*, separados por vírgula."
-        p, a = _gen_add_direct_shuffled(anchor or 1, mode)
-        return {
-            "problems": p,
-            "answers": a,
-            "title": title,
-            "spec": {**spec, "model": model},
-            "prompt_hint": prompt_hint,
-            "prompt_example": None
-        }
-
     title = f"Matemática — {phase}"
     if op == "soma":
         if mode == "direct":
@@ -350,8 +272,7 @@ def _build_batch_from_spec(spec: dict, *, model: str | None = None):
         else:
             p,a = _gen_div_mix();            title += " · misto"
     else:
-        # revisão dinâmica pela âncora (se vier None, usa 1)
-        p,a = _gen_review_for_anchor(anchor or 1); title += f" · revisão"
+        p,a = _gen_review_for_anchor(anchor or 1); title += " · revisão"
     return {"problems": p, "answers": a, "title": title, "spec": spec}
 
 # ---------- Avanço de âncora / Roteiro progressivo ----------
@@ -367,25 +288,16 @@ def _spec_for_round(base_spec: dict, round_idx: int) -> dict:
     """
     spec = dict(base_spec)
     day_anchor = min(20, max(1, int(spec.get("anchor") or 1)))
-
     plan = [
-        ("soma", "direct",  day_anchor),                        # R1
-        ("sub",  "minuend", max(11, min(20, day_anchor + 10))), # R2  (minuendo 11..20)
-        ("mult", "direct",  day_anchor),                        # R3
-        ("div",  "divisor", day_anchor),                        # R4
-        ("mix",  "review",  day_anchor),                        # R5
+        ("soma", "direct",  day_anchor),
+        ("sub",  "minuend", max(11, min(20, day_anchor + 10))),
+        ("mult", "direct",  day_anchor),
+        ("div",  "divisor", day_anchor),
+        ("mix",  "review",  day_anchor),
     ]
     i = max(1, min(5, int(round_idx))) - 1
     op2, mode2, a2 = plan[i]
-
-    phase_by_op = {
-        "soma": "A-Adição",
-        "sub":  "B-Subtração",
-        "mult": "C-Multiplicação",
-        "div":  "D-Divisão",
-        "mix":  "Revisão",
-    }
-
+    phase_by_op = {"soma":"A-Adição","sub":"B-Subtração","mult":"C-Multiplicação","div":"D-Divisão","mix":"Revisão"}
     spec["op"]    = op2
     spec["mode"]  = mode2
     spec["anchor"]= a2
@@ -405,25 +317,9 @@ def _apply_round_variation(batch: dict, round_idx: int):
 def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
     day = max(1, min(MAX_MATH_DAY, int(day)))
     base_spec = _curriculum_spec(day)
-
-    # Planeja modelos do dia (só afeta Adição, R1)
-    day_plan = user.get("pending", {}).get("math_models")
-    if not day_plan or day_plan.get("day") != day:
-        models = _models_for_day("soma", day)
-        if models:
-            user.setdefault("pending", {})["math_models"] = {"day": day, "models": models}
-        else:
-            user.setdefault("pending", {})["math_models"] = None
-
-    model = None
-    if user.get("pending", {}).get("math_models"):
-        models = user["pending"]["math_models"]["models"]
-        if models:
-            idx = (round_idx - 1) % len(models)
-            model = models[idx]
-
     spec = _spec_for_round(base_spec, round_idx)
-    batch = _build_batch_from_spec(spec, model=(model if spec["op"] == "soma" else None))
+
+    batch = _build_batch_from_spec(spec)
     batch["day"] = day
     batch["round"] = round_idx
     batch["rounds_total"] = ROUNDS_PER_DAY
@@ -432,7 +328,7 @@ def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
     user["pending"]["mat_lote"] = batch
     return batch
 
-# ------------------- Correção / avanço -------------------
+# ------------------- Correção / avanço (Matemática) -------------------
 def _check_math_batch(user, text: str):
     pend = user.get("pending", {}).get("mat_lote")
     if not pend:
@@ -477,13 +373,10 @@ def _check_math_batch(user, text: str):
         return True, f"✅ Rodada {round_idx}/{rounds_total} concluída! Vamos para a *Rodada {next_round}/{rounds_total}*.\n\n" + _format_math_prompt(batch2)
 
     # Fechou as rodadas → avança dia (até 60)
-    user["levels"]["matematica"] += 1
+    user["levels"]["matematica"] = user["levels"].get("matematica", 0) + 1
     cur = user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
     next_day = min(MAX_MATH_DAY, int(cur.get("math_day",1)) + 1)
     cur["math_day"] = next_day
-
-    # limpa plano de modelos do dia concluído
-    user.get("pending", {}).pop("math_models", None)
 
     if day == MAX_MATH_DAY and round_idx == rounds_total:
         return True, "🎉 *Parabéns!* Você concluiu o plano até o *dia 60*. Para recomeçar, envie *reiniciar*."
@@ -491,14 +384,188 @@ def _check_math_batch(user, text: str):
     batch2 = _start_math_batch_for_day(user, next_day, 1)
     return True, f"🎉 *Parabéns!* Dia {day} concluído.\nAgora avançando para o *dia {next_day}*.\n\n" + _format_math_prompt(batch2)
 
-# ------------------- Stubs para módulos desativados -------------------
-def _start_portugues(user):
-    return "✍️ *Português* está temporariamente desativado."
+# ============================================================
+# ===================== PORTUGUÊS (novo) =====================
+# ============================================================
+# Temas rotativos por dia
+PT_THEMES = ["vogais", "m_n", "p_b", "t_d", "c_g"]
+PT_THEME_LABEL = {
+    "vogais": "Vogais",
+    "m_n": "M/N",
+    "p_b": "P/B",
+    "t_d": "T/D",
+    "c_g": "C/G",
+}
 
-def _start_leitura(user):
-    return "📖 *Leitura* está temporariamente desativada."
+def _pt_theme_for_day(day: int) -> str:
+    return PT_THEMES[(max(1, int(day)) - 1) % len(PT_THEMES)]
 
-# ------------------- Onboarding (MARIA ANGELA) -------------------
+# Bancos de palavras (sem acentos para facilitar digitação/correção)
+PT_WORDS = {
+    "vogais": ["abelha","elefante","igreja","ovelha","uva","abacate","escola","ilha","ovo","urso"],
+    "m_n":    ["mala","mapa","mesa","milho","manga","ninho","nariz","neto","neve","nota"],
+    "p_b":    ["pato","pote","pena","pano","pipa","bola","barco","beijo","boca","bala"],
+    "t_d":    ["tatu","teto","tapa","tubo","taco","dado","dedo","dente","dama","duna"],
+    "c_g":    ["casa","copo","cabo","cama","cubo","gato","gola","galo","gomo","gude"],
+}
+
+def _format_pt_prompt(batch):
+    title = batch.get("title", "Português")
+    round_i = batch.get("round", 1)
+    round_n = batch.get("rounds_total", 1)
+
+    hint = batch.get("prompt_hint") or "Responda TUDO em uma única mensagem, *separando por vírgulas*."
+    example = batch.get("prompt_example") or "Ex.: a,b,c,d,e,f,g,h,i,j"
+
+    lines = [
+        f"✍️ *{title}* — Rodada {round_i}/{round_n}",
+        hint,
+        example,
+        ""
+    ]
+    for idx, p in enumerate(batch["problems"], start=1):
+        lines.append(f"{idx}) {p}")
+    return "\n".join(lines)
+
+def _parse_csv_tokens(s: str):
+    parts = [x.strip().lower() for x in (s or "").split(",") if x.strip() != ""]
+    return parts if parts else None
+
+# Helpers para sílaba inicial dinâmica:
+def _first_chunk(word: str) -> str:
+    # se começa com vogal → 1 letra, senão → consoante+vogal (2 letras)
+    if not word: return ""
+    return word[0] if word[0] in "aeiou" else word[:2]
+
+def _rest_chunk(word: str) -> str:
+    k = 1 if word and word[0] in "aeiou" else 2
+    return word[k:]
+
+# Geradores por rodada (Português)
+def _pt_round1_som_inicial(theme: str):
+    words = PT_WORDS[theme]
+    problems = [f"Letra inicial de *{w.upper()}* = ?" for w in words]
+    answers  = [w[0] for w in words]
+    return problems, answers, "Som inicial (diga só a letra).", "Ex.: p,b,a,n,..."
+
+def _pt_round2_silabas(theme: str):
+    words = PT_WORDS[theme]
+    problems = [f"Complete: (___) + { _rest_chunk(w).upper() }" for w in words]
+    answers  = [_first_chunk(w) for w in words]
+    return problems, answers, "Sílabas: responda a sílaba/letra inicial (ex.: pa, ba, ta, ga, a...).", "Ex.: pa,ba,ta,da,ca,ga,a,e,i,o"
+
+def _pt_round3_decodificacao(theme: str):
+    words = PT_WORDS[theme]
+    problems = [f"Junte e escreva: { _first_chunk(w).upper() }-{ _rest_chunk(w).upper() }" for w in words]
+    answers  = [w for w in words]
+    return problems, answers, "Decodifique e escreva a palavra (sem acentos).", "Ex.: pato,bola,casa,..."
+
+def _pt_round4_ortografia(theme: str):
+    words = PT_WORDS[theme]
+    problems = [f"Complete a palavra: {'_'*len(_first_chunk(w))}{ _rest_chunk(w).upper() }" for w in words]
+    answers  = [_first_chunk(w) for w in words]
+    return problems, answers, "Ortografia: escreva a(s) letra(s) que faltam no começo.", "Ex.: pa,ba,a,ta,ga..."
+
+def _pt_round5_leitura(theme: str):
+    words = PT_WORDS[theme]
+    problems = [f"Leia e escreva a palavra: {w.upper()}" for w in words]
+    answers  = [w for w in words]
+    return problems, answers, "Leitura: copie a palavra (sem acentos).", "Ex.: gato,casa,pato,..."
+
+def _build_pt_batch(day: int, round_idx: int):
+    theme = _pt_theme_for_day(day)
+    theme_label = PT_THEME_LABEL[theme]
+    title = f"Português — {theme_label}"
+
+    if round_idx == 1:
+        p,a,h,e = _pt_round1_som_inicial(theme)
+    elif round_idx == 2:
+        p,a,h,e = _pt_round2_silabas(theme)
+    elif round_idx == 3:
+        p,a,h,e = _pt_round3_decodificacao(theme)
+    elif round_idx == 4:
+        p,a,h,e = _pt_round4_ortografia(theme)
+    else:
+        p,a,h,e = _pt_round5_leitura(theme)
+
+    return {
+        "day": day,
+        "round": round_idx,
+        "rounds_total": ROUNDS_PER_DAY,
+        "title": title,
+        "problems": p,
+        "answers": a,
+        "spec": {"module":"pt", "theme": theme, "round": round_idx},
+        "prompt_hint": h,
+        "prompt_example": e,
+    }
+
+def _start_pt_batch_for_day(user, day: int, round_idx: int = 1):
+    day = max(1, min(MAX_PT_DAY, int(day)))
+    batch = _build_pt_batch(day, round_idx)
+    # leve variação de ordem como na matemática
+    _apply_round_variation(batch, round_idx)
+    user["pending"]["pt_lote"] = batch
+    return batch
+
+def _check_pt_batch(user, text: str):
+    pend = user.get("pending", {}).get("pt_lote")
+    if not pend:
+        return False, "Nenhum lote de Português pendente."
+
+    raw = (text or "").strip().lower()
+    if raw in {"ok", "ok!", "ok."}:
+        spec = pend.get("spec", {})
+        user["history"]["portugues"].append({
+            "tipo": "lote", "spec": spec,
+            "problems": pend["problems"], "answers": pend["answers"],
+            "bypass": "ok", "round": pend.get("round"), "day": pend.get("day"),
+        })
+    else:
+        expected = pend["answers"]
+        got = _parse_csv_tokens(text)
+        if got is None:
+            return False, "Envie respostas *textuais* separadas por vírgula (ex.: p,b,a,pa,ga...)."
+        if len(got) != len(expected):
+            return False, f"Você enviou {len(got)} respostas, mas são {len(expected)} itens. Reenvie os {len(expected)} valores."
+        wrong_idx = [i+1 for i, (g,e) in enumerate(zip(got, expected)) if g != (e or "").lower()]
+        if wrong_idx:
+            pos = ", ".join(map(str, wrong_idx))
+            return False, f"❌ Algumas respostas estão incorretas nas posições: {pos}. Reenvie a lista completa."
+        spec = pend.get("spec", {})
+        user["history"]["portugues"].append({
+            "tipo": "lote", "spec": spec,
+            "problems": pend["problems"], "answers": got,
+            "round": pend.get("round"), "day": pend.get("day"),
+        })
+
+    # Avança rodada/dia em PT
+    round_idx = int(pend.get("round", 1))
+    rounds_total = int(pend.get("rounds_total", ROUNDS_PER_DAY))
+    day = int(user.get("curriculum_pt",{}).get("pt_day",1))
+
+    user["pending"].pop("pt_lote", None)
+
+    if round_idx < rounds_total:
+        next_round = round_idx + 1
+        batch2 = _start_pt_batch_for_day(user, day, next_round)
+        return True, f"✅ Rodada {round_idx}/{rounds_total} (PT) concluída! Vamos para a *Rodada {next_round}/{rounds_total}*.\n\n" + _format_pt_prompt(batch2)
+
+    # última rodada do dia → avança dia PT
+    user["levels"]["portugues"] = user["levels"].get("portugues", 0) + 1
+    cur = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
+    next_day = min(MAX_PT_DAY, int(cur.get("pt_day",1)) + 1)
+    cur["pt_day"] = next_day
+
+    if day == MAX_PT_DAY and round_idx == rounds_total:
+        return True, "🎉 *Parabéns!* Você concluiu o plano de Português até o final. Para recomeçar, envie *reiniciar pt*."
+
+    batch2 = _start_pt_batch_for_day(user, next_day, 1)
+    return True, f"🎉 *Parabéns!* Português do dia {day} concluído.\nAgora avançando para o *dia {next_day}*.\n\n" + _format_pt_prompt(batch2)
+
+# ============================================================
+# ==================== Onboarding (MA) =======================
+# ============================================================
 def needs_onboarding(user) -> bool:
     prof = user.get("profile", {})
     if not prof.get("child_name"): return True
@@ -520,7 +587,7 @@ def ob_state(user):
 def ob_start() -> str:
     return (
         "Oi! Eu sou a *MARIA ANGELA* 🌟 sua assistente de aula.\n"
-        "Vou te acompanhar em atividades de *Matemática*.\n\n"
+        "Vou te acompanhar em atividades de *Matemática* e *Português*.\n\n"
         "Pra começar, me diga: *qual é o nome da criança?*"
     )
 
@@ -675,10 +742,11 @@ def ob_step(user, text: str) -> str:
             sched = data.get("schedule", {})
             prof["schedule"] = {"days": [d for d in DAY_ORDER if d in (sched.get("days") or [])],
                                 "times": sched.get("times", {})}
-            user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
+            user.setdefault("curriculum",   {"math_day": 1, "total_days": MAX_MATH_DAY})
+            user.setdefault("curriculum_pt",{"pt_day":   1, "total_days": MAX_PT_DAY})
             user["onboarding"] = {"step": None, "data": {}}
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
-                    "Envie *iniciar* para começar o *Dia 1* do plano.")
+                    "Envie *iniciar* (Matemática) ou *iniciar pt* (Português) para começar.")
         elif t in {"não","nao"}:
             return ("Sem problema! Você pode corrigir assim:\n"
                     "• *nome:* Ana Souza\n• *idade:* 7\n• *serie:* 2º ano\n"
@@ -714,6 +782,11 @@ def bot_webhook():
     user.setdefault("profile", {})
     user.setdefault("onboarding", {"step": None, "data": {}})
     user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
+    user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
+    user.setdefault("levels", {}).setdefault("matematica", 0)
+    user.setdefault("levels", {}).setdefault("portugues", 0)
+    user.setdefault("history", {}).setdefault("matematica", [])
+    user.setdefault("history", {}).setdefault("portugues", [])
 
     # -------- Onboarding primeiro --------
     if needs_onboarding(user):
@@ -729,99 +802,127 @@ def bot_webhook():
     # -------- Comandos --------
     if low in {"menu", "ajuda", "help"}:
         reply = (
-            "Para começar a atividade de hoje, envie *iniciar*.\n"
-            f"Cada dia tem *{ROUNDS_PER_DAY} rodadas* de *10 exercícios*.\n"
-            "Rodadas: 1) Adição  2) Subtração  3) Multiplicação  4) Divisão  5) Mista.\n"
-            "Os números progridem de 1 até 20 ao longo dos dias.\n"
-            "Responda os resultados *separados por vírgula* ou envie *ok*.\n"
-            "Comandos: *iniciar*, *resposta X*, *ok*, *status*, *debug*, *reiniciar*, *resetar*."
+            "Para começar, envie *iniciar* (Matemática) ou *iniciar pt* (Português).\n"
+            f"Cada dia tem *{ROUNDS_PER_DAY} rodadas* de *10 itens*.\n"
+            "MAT Rodadas: 1) Adição  2) Subtração  3) Multiplicação  4) Divisão  5) Mista.\n"
+            "PT  Rodadas: 1) Som inicial  2) Sílabas  3) Decodificação  4) Ortografia  5) Leitura.\n"
+            "Responda em *CSV* (separe por vírgulas) ou envie *ok* para pular e avançar.\n"
+            "Comandos: *iniciar*, *iniciar pt*, *resposta ...*, *ok*, *status*, *debug*, *reiniciar*, *reiniciar pt*."
         )
         return reply_twiml(reply)
 
     if low == "status":
         cur_day = int(user.get("curriculum",{}).get("math_day",1))
-        pend = user.get("pending", {}).get("mat_lote")
-        round_info = f"{pend.get('round',1)}/{pend.get('rounds_total',ROUNDS_PER_DAY)}" if pend else "—"
-        reply = (
-            f"Dia atual: {cur_day}/{MAX_MATH_DAY}\n"
-            f"Rodada: {round_info}\n"
-            f"Nível MAT: {user['levels']['matematica']}\n"
-            f"Feitas MAT: {len(user['history']['matematica'])}"
-        )
+        cur_pt  = int(user.get("curriculum_pt",{}).get("pt_day",1))
+        pend    = user.get("pending", {}).get("mat_lote")
+        pend_pt = user.get("pending", {}).get("pt_lote")
+        round_mat = f"{pend.get('round',1)}/{pend.get('rounds_total',ROUNDS_PER_DAY)}" if pend else "—"
+        round_pt  = f"{pend_pt.get('round',1)}/{pend_pt.get('rounds_total',ROUNDS_PER_DAY)}" if pend_pt else "—"
+        reply = (f"📊 *Status*\n"
+                 f"• Matemática: dia {cur_day}/{MAX_MATH_DAY} | rodada {round_mat} | nível {user['levels']['matematica']} | feitos {len(user['history']['matematica'])}\n"
+                 f"• Português:  dia {cur_pt}/{MAX_PT_DAY} | rodada {round_pt} | nível {user['levels']['portugues']} | feitos {len(user['history']['portugues'])}")
         return reply_twiml(reply)
 
     if low == "debug":
         cur_day = int(user.get("curriculum", {}).get("math_day", 1))
-        pend = user.get("pending", {}).get("mat_lote")
-        pend_flag = "sim" if pend else "não"
+        cur_pt  = int(user.get("curriculum_pt", {}).get("pt_day", 1))
+        pend    = user.get("pending", {}).get("mat_lote")
+        pend_pt = user.get("pending", {}).get("pt_lote")
+        pend_flag   = "sim" if pend else "não"
+        pend_ptflag = "sim" if pend_pt else "não"
         spec = (pend or {}).get("spec", {}) or {}
+        spec_pt = (pend_pt or {}).get("spec", {}) or {}
         title = (pend or {}).get("title", "-")
-        phase = spec.get("phase", "-"); op = spec.get("op", "-")
-        mode  = spec.get("mode", "-");  anchor = spec.get("anchor", "-")
-        model = spec.get("model", "-")
+        title_pt = (pend_pt or {}).get("title", "-")
         round_str = f"{(pend or {}).get('round','-')}/{(pend or {}).get('rounds_total','-')}" if pend else "-"
+        round_str_pt = f"{(pend_pt or {}).get('round','-')}/{(pend_pt or {}).get('rounds_total','-')}" if pend_pt else "-"
+        phase = spec.get("phase","-"); op = spec.get("op","-"); mode = spec.get("mode","-"); anchor = spec.get("anchor","-")
         reply = (
             "🛠 *DEBUG*\n"
-            f"• math_day: {cur_day}/{MAX_MATH_DAY}\n"
-            f"• pendência: {pend_flag}\n"
-            f"• round: {round_str}\n"
-            f"• title: {title}\n"
-            f"• spec: phase={phase} | op={op} | mode={mode} | anchor={anchor} | model={model}"
+            f"• MAT day: {cur_day}/{MAX_MATH_DAY} | pendência: {pend_flag} | round: {round_str}\n"
+            f"  title: {title}\n"
+            f"  spec: phase={phase} | op={op} | mode={mode} | anchor={anchor}\n"
+            f"• PT  day: {cur_pt}/{MAX_PT_DAY} | pendência: {pend_ptflag} | round: {round_str_pt}\n"
+            f"  title: {title_pt}\n"
+            f"  spec: {spec_pt}"
         )
         return reply_twiml(reply)
 
     if low in {"reiniciar", "zerar", "resetar"}:
         user["curriculum"] = {"math_day": 1, "total_days": MAX_MATH_DAY}
         user["pending"].pop("mat_lote", None)
-        user["pending"].pop("math_models", None)
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml("🔁 Plano reiniciado. Envie *iniciar* para começar do *Dia 1* (Rodada 1).")
+        return reply_twiml("🔁 Matemática reiniciada. Envie *iniciar* para começar do *Dia 1* (Rodada 1).")
 
+    if low in {"reiniciar pt", "resetar pt", "zerar pt"}:
+        user["curriculum_pt"] = {"pt_day": 1, "total_days": MAX_PT_DAY}
+        user["pending"].pop("pt_lote", None)
+        db["users"][user_id] = user; save_db(db)
+        return reply_twiml("🔁 Português reiniciado. Envie *iniciar pt* para começar do *Dia 1* (Rodada 1).")
+
+    # -------- Iniciar sessões --------
     if low == "iniciar":
-        # reapresenta a pendência
         if "mat_lote" in user.get("pending", {}):
             batch = user["pending"]["mat_lote"]
             db["users"][user_id] = user; save_db(db)
             return reply_twiml(_format_math_prompt(batch))
-        # limite do plano
         day = int(user.get("curriculum",{}).get("math_day",1))
         if day > MAX_MATH_DAY:
             return reply_twiml("✅ Você já concluiu o plano até o *dia 60*. Envie *reiniciar* para começar de novo.")
-        # cria rodada 1
         batch = _start_math_batch_for_day(user, day, 1)
         db["users"][user_id] = user; save_db(db)
         nome = first_name_from_profile(user)
-        saudacao = f"Olá, {nome}! Iremos iniciar nossas atividades de hoje. 👋"
+        saudacao = f"Olá, {nome}! Vamos iniciar *Matemática* de hoje. 👋"
         return reply_twiml(saudacao + "\n\n" + _format_math_prompt(batch))
+
+    if low in {"iniciar pt","pt iniciar","iniciar português","iniciar portugues"}:
+        if not FEATURE_PORTUGUES:
+            return reply_twiml("✍️ *Português* está desativado no momento.")
+        if "pt_lote" in user.get("pending", {}):
+            batch = user["pending"]["pt_lote"]
+            db["users"][user_id] = user; save_db(db)
+            return reply_twiml(_format_pt_prompt(batch))
+        day = int(user.get("curriculum_pt",{}).get("pt_day",1))
+        if day > MAX_PT_DAY:
+            return reply_twiml("✅ Você já concluiu o plano de *Português*. Envie *reiniciar pt* para começar de novo.")
+        batch = _start_pt_batch_for_day(user, day, 1)
+        db["users"][user_id] = user; save_db(db)
+        nome = first_name_from_profile(user)
+        saudacao = f"Olá, {nome}! Vamos iniciar *Português* de hoje. 👋"
+        return reply_twiml(saudacao + "\n\n" + _format_pt_prompt(batch))
 
     if low.startswith("leitura ok"):
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml("📖 *Leitura* está desativada no momento. Siga com *Matemática*.")
+        return reply_twiml("📖 *Leitura* está desativada no momento. Siga com *Matemática* ou *Português*.")
 
     # -------- Respostas --------
-    if low in {"ok", "ok!", "ok."} and "mat_lote" not in user.get("pending", {}):
+    # Preferência: se PT está pendente, tratamos PT primeiro; senão Matemática
+    if low in {"ok", "ok!", "ok."} and ("pt_lote" not in user.get("pending", {}) and "mat_lote" not in user.get("pending", {})):
+        # nenhuma pendência → abrir a do dia de Matemática por padrão
         day = int(user.get("curriculum",{}).get("math_day",1))
         if day > MAX_MATH_DAY:
-            return reply_twiml("✅ Plano encerrado no *dia 60*. Envie *reiniciar* para recomeçar.")
+            return reply_twiml("✅ Plano de Matemática encerrado. Envie *reiniciar* para recomeçar.")
         _start_math_batch_for_day(user, day, 1)
+
+    if "pt_lote" in user.get("pending", {}):
+        raw = text
+        if low.startswith("resposta"):
+            raw = text.split(" ", 1)[1].strip() if " " in text else ""
+            raw = raw.lstrip(":.-").strip() or raw
+        ok_flag, msg = _check_pt_batch(user, raw)
+        db["users"][user_id] = user; save_db(db)
+        return reply_twiml(msg)
 
     if "mat_lote" in user.get("pending", {}):
         raw = text
         if low.startswith("resposta"):
-            raw = text[len("resposta"):].strip()
-            if not raw and " " in text:
-                raw = text.split(" ", 1)[1].strip()
+            raw = text.split(" ", 1)[1].strip() if " " in text else ""
             raw = raw.lstrip(":.-").strip() or raw
         ok_flag, msg = _check_math_batch(user, raw)
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg)
 
-    if "portugues" in user.get("pending", {}):
-        user["pending"].pop("portugues", None)
-        db["users"][user_id] = user; save_db(db)
-        return reply_twiml("✍️ *Português* está desativado no momento. Continuaremos com *Matemática*.")
-
-    return reply_twiml("Envie *iniciar* para começar a sessão do dia (*Matemática*).")
+    return reply_twiml("Envie *iniciar* (Matemática) ou *iniciar pt* (Português) para começar.")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
