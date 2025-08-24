@@ -163,21 +163,45 @@ def _module_label(op: str, etapa: int) -> str:
     extra = { "soma": f"+{etapa}", "sub": f"-{etapa}", "mult": f"×{etapa}", "div": f"÷{etapa}", "mix": "" }
     return f"{labels.get(op, op.title())} {etapa} ({extra.get(op,'')})"
 
+# ---------- Modelos/variedade (ADIÇÃO) ----------
+# nomes de modelos: mix10_missing, direct_shuffled, missing_anchor, near_doubles, sort_results
+ADD_MODEL_TITLES = {
+    "mix10_missing": "Completar 10",
+    "direct_shuffled": "Direta (embaralhada)",
+    "missing_anchor": "Faltou quanto? (+âncora)",
+    "near_doubles": "Mistão (dobros/quase-dobros)",
+    "sort_results": "Ordene os resultados",
+}
 
+def _add_models_base_order():
+    # ordem base para 5 rodadas; rotacionamos por dia p/ ficar variado entre dias
+    return ["mix10_missing", "direct_shuffled", "missing_anchor", "near_doubles", "sort_results"]
+
+def _models_for_day(op: str, day: int):
+    if op != "soma":
+        return None
+    base = _add_models_base_order()
+    rot = (day - 1) % len(base)
+    return base[rot:] + base[:rot]
+
+# ---------- Enunciado ----------
 def _format_math_prompt(batch):
     title = batch.get("title", "Matemática")
     round_i = batch.get("round", 1)
     round_n = batch.get("rounds_total", 1)
+
+    hint = batch.get("prompt_hint") or "Responda TUDO em uma única mensagem, *separando por vírgulas*."
+    example = batch.get("prompt_example") or "Ex.: 2,4,6,8,10,12,14,16,18,20"
+
     lines = [
         f"🧩 *{title}* — Rodada {round_i}/{round_n}",
-        "Responda TUDO em uma única mensagem, *separando por vírgulas*.",
-        "Ex.: 2,4,6,8,10,12,14,16,18,20",
+        hint,
+        example,
         ""
     ]
     for idx, p in enumerate(batch["problems"], start=1):
         lines.append(f"{idx}) {p} = ?")
     return "\n".join(lines)
-
 
 def _parse_csv_numbers(s: str):
     parts = [x.strip() for x in (s or "").split(",") if x.strip() != ""]
@@ -189,18 +213,16 @@ def _parse_csv_numbers(s: str):
             return None
     return nums
 
-# ---------- Geradores ----------
+# ---------- Geradores base ----------
 def _gen_add_direct(a: int):
     problems = [f"{a}+{i}" for i in range(1, 11)]
     answers  = [a + i for i in range(1, 11)]
     return problems, answers
 
-
 def _gen_add_inv(a: int):
     problems = [f"{i}+{a}" for i in range(1, 11)]
     answers  = [i + a for i in range(1, 11)]
     return problems, answers
-
 
 def _gen_add_mix10():
     pairs = [(1,9),(2,8),(3,7),(4,6),(5,5),(6,4),(7,3),(8,2),(9,1),(10,0)]
@@ -208,12 +230,10 @@ def _gen_add_mix10():
     answers  = [x+y for x,y in pairs]
     return problems, answers
 
-
 def _gen_sub_minuend(m: int):
     problems = [f"{m}-{i}" for i in range(1, 11)]
     answers  = [m - i for i in range(1, 11)]
     return problems, answers
-
 
 def _gen_sub_mix():
     base = list(range(11, 16))
@@ -227,12 +247,10 @@ def _gen_sub_mix():
     problems = problems[:10]; answers  = answers[:10]
     return problems, answers
 
-
 def _gen_mult_direct(a: int):
     problems = [f"{a}x{i}" for i in range(1, 11)]
     answers  = [a * i for i in range(1, 11)]
     return problems, answers
-
 
 def _gen_mult_commute(a: int):
     left  = [f"{a}x{i}" for i in range(1, 6)]
@@ -241,19 +259,16 @@ def _gen_mult_commute(a: int):
     answers  = [a*i for i in range(1,6)] + [i*a for i in range(6,11)]
     return problems, answers
 
-
 def _gen_div_divisor(d: int):
     problems = [f"{d*i}/{d}" for i in range(1, 11)]
     answers  = [i for i in range(1, 11)]
     return problems, answers
-
 
 def _gen_div_mix():
     divs = [(12,3),(14,7),(16,4),(18,9),(20,5),(21,7),(24,6),(30,5),(32,8),(40,10)]
     problems = [f"{a}/{b}" for a,b in divs]
     answers  = [a//b for a,b in divs]
     return problems, answers
-
 
 def _gen_review_mix():
     adds = [(7,3),(8,5),(9,6)]
@@ -270,9 +285,84 @@ def _gen_review_mix():
                [a//b for a,b in divs]
     return problems, answers
 
+# ---------- Geradores especiais (ADIÇÃO) ----------
+def _gen_add_direct_shuffled(anchor: int, mode: str):
+    if mode == "inv":
+        probs, ans = _gen_add_inv(anchor)
+    else:
+        probs, ans = _gen_add_direct(anchor)
+    # rotação simples para embaralhar de forma determinística
+    # (a rotação final por rodada também acontece em _apply_round_variation)
+    return probs, ans
 
-def _build_batch_from_spec(spec: dict):
+def _gen_add_missing_to_10():
+    # __ + a = 10, para a = 1..10  (respostas 9..0)
+    problems = [f"__+{a}=10" for a in range(1, 11)]
+    answers  = [10 - a for a in range(1, 11)]
+    return problems, answers
+
+def _gen_add_missing_anchor(anchor: int):
+    # __ + anchor = target, target anchor+5..anchor+14
+    targets = [anchor + i for i in range(5, 15)]
+    problems = [f"__+{anchor}={t}" for t in targets]
+    answers  = [t - anchor for t in targets]
+    return problems, answers
+
+def _gen_add_near_doubles():
+    pairs = [(4,7),(6,6),(5,8),(7,7),(8,5),(9,4),(5,6),(8,3),(7,6),(6,9)]
+    problems = [f"{a}+{b}" for a,b in pairs]
+    answers  = [a+b for a,b in pairs]
+    return problems, answers
+
+def _gen_add_sort_results_set():
+    pairs = [(7,3),(5,6),(3,9),(8,2),(4,8),(6,5),(4,7),(9,1),(5,5),(2,9)]
+    problems = [f"{a}+{b}" for a,b in pairs]
+    sums     = [a+b for a,b in pairs]
+    answers  = sorted(sums)
+    return problems, answers
+
+# ---------- Build do lote (com modelos para adição) ----------
+def _build_batch_from_spec(spec: dict, *, model: str | None = None):
     phase = spec["phase"]; op = spec["op"]; mode = spec["mode"]; anchor = spec["anchor"]
+
+    # Adição com variedade de modelos
+    if op == "soma" and model:
+        title = f"Matemática — {phase} · {ADD_MODEL_TITLES.get(model, model)}"
+        prompt_hint = None
+        prompt_example = None
+
+        if model == "mix10_missing":
+            p, a = _gen_add_missing_to_10()
+            prompt_hint = "Complete os espaços: responda apenas o *número que falta* em cada conta."
+            prompt_example = "Ex.: 9,8,7,6,5,4,3,2,1,0"
+        elif model == "direct_shuffled":
+            p, a = _gen_add_direct_shuffled(anchor or 1, mode)
+            prompt_hint = "Some e responda *os 10 resultados*, separados por vírgula."
+        elif model == "missing_anchor":
+            p, a = _gen_add_missing_anchor(anchor or 1)
+            prompt_hint = "Responda apenas o *número que falta* em: __ + k = alvo."
+        elif model == "near_doubles":
+            p, a = _gen_add_near_doubles()
+            prompt_hint = "Some mentalmente (dobros e quase-dobros) e responda os resultados."
+        elif model == "sort_results":
+            p, a = _gen_add_sort_results_set()
+            prompt_hint = "Calcule cada soma e responda *só os resultados em ordem crescente*."
+            prompt_example = "Ex.: 5,6,6,7,7,8,8,9,10,12"
+        else:
+            # fallback para direta
+            p, a = _gen_add_direct(anchor or 1)
+            prompt_hint = "Some e responda os resultados."
+
+        return {
+            "problems": p,
+            "answers": a,
+            "title": title,
+            "spec": {**spec, "model": model},
+            "prompt_hint": prompt_hint,
+            "prompt_example": prompt_example
+        }
+
+    # Demais operações (mantém geração clássica)
     title = f"Matemática — {phase}"
     if op == "soma":
         if mode == "direct":
@@ -299,7 +389,6 @@ def _build_batch_from_spec(spec: dict):
     else:
         p,a = _gen_review_mix();             title += " · revisão"
     return {"problems": p, "answers": a, "title": title, "spec": spec}
-
 
 # ---------- Avanço de âncora por rodada (5 etapas/dia) ----------
 def _spec_for_round(base_spec: dict, round_idx: int) -> dict:
@@ -331,7 +420,6 @@ def _spec_for_round(base_spec: dict, round_idx: int) -> dict:
     spec["anchor"] = new_anchor
     return spec
 
-
 def _apply_round_variation(batch: dict, round_idx: int):
     """Varia ordem determinística por rodada (rotaciona)."""
     p = batch["problems"][:]; a = batch["answers"][:]
@@ -342,13 +430,28 @@ def _apply_round_variation(batch: dict, round_idx: int):
     batch["problems"] = p; batch["answers"] = a
     return batch
 
-
 def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
     day = max(1, min(MAX_MATH_DAY, int(day)))
     base_spec = _curriculum_spec(day)
-    spec = _spec_for_round(base_spec, round_idx)
 
-    batch = _build_batch_from_spec(spec)
+    # Escolha/planejamento de modelos do dia (apenas adição por enquanto)
+    day_plan = user.get("pending", {}).get("math_models")
+    if not day_plan or day_plan.get("day") != day:
+        models = _models_for_day(base_spec["op"], day)
+        if models:
+            user.setdefault("pending", {})["math_models"] = {"day": day, "models": models}
+        else:
+            user.setdefault("pending", {})["math_models"] = None
+
+    model = None
+    if user.get("pending", {}).get("math_models"):
+        models = user["pending"]["math_models"]["models"]
+        # evita repetir modelo consecutivo (lista de 5 já sem repetição)
+        idx = (round_idx - 1) % len(models)
+        model = models[idx]
+
+    spec = _spec_for_round(base_spec, round_idx)
+    batch = _build_batch_from_spec(spec, model=model)
     batch["day"] = day
     batch["round"] = round_idx
     batch["rounds_total"] = ROUNDS_PER_DAY
@@ -356,7 +459,6 @@ def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
     _apply_round_variation(batch, round_idx)
     user["pending"]["mat_lote"] = batch
     return batch
-
 
 # ------------------- Correção / avanço -------------------
 def _check_math_batch(user, text: str):
@@ -409,21 +511,21 @@ def _check_math_batch(user, text: str):
     next_day = min(MAX_MATH_DAY, int(cur.get("math_day",1)) + 1)
     cur["math_day"] = next_day
 
+    # limpa plano de modelos do dia concluído
+    user.get("pending", {}).pop("math_models", None)
+
     if day == MAX_MATH_DAY and round_idx == rounds_total:
         return True, "🎉 *Parabéns!* Você concluiu o plano até o *dia 60*. Para recomeçar, envie *reiniciar*."
 
     batch2 = _start_math_batch_for_day(user, next_day, 1)
     return True, f"🎉 *Parabéns!* Dia {day} concluído.\nAgora avançando para o *dia {next_day}*.\n\n" + _format_math_prompt(batch2)
 
-
 # ------------------- Stubs para módulos desativados -------------------
 def _start_portugues(user):
     return "✍️ *Português* está temporariamente desativado."
 
-
 def _start_leitura(user):
     return "📖 *Leitura* está temporariamente desativada."
-
 
 # ------------------- Onboarding (MARIA ANGELA) -------------------
 def needs_onboarding(user) -> bool:
@@ -440,11 +542,9 @@ def needs_onboarding(user) -> bool:
     if not times or not all(d in times and times[d] for d in days): return True
     return False
 
-
 def ob_state(user):
     user.setdefault("onboarding", {"step": None, "data": {}})
     return user["onboarding"]
-
 
 def ob_start() -> str:
     return (
@@ -452,7 +552,6 @@ def ob_start() -> str:
         "Vou te acompanhar em atividades de *Matemática*.\n\n"
         "Pra começar, me diga: *qual é o nome da criança?*"
     )
-
 
 def _schedule_init_days(data, include_sun: bool):
     days = DEFAULT_DAYS.copy()
@@ -463,7 +562,6 @@ def _schedule_init_days(data, include_sun: bool):
     data["schedule"]["pending_days"] = days.copy()
     data["schedule"]["current_day"]  = None
 
-
 def _prompt_for_next_day_time(data) -> str:
     pend = data["schedule"]["pending_days"]
     if not pend:
@@ -472,7 +570,6 @@ def _prompt_for_next_day_time(data) -> str:
     data["schedule"]["current_day"] = day
     label = DAYS_PT.get(day, day)
     return f"Qual *horário* para *{label}*? (ex.: 18:30, 19h, 7 pm) — faixa 05:00–21:30."
-
 
 def _set_time_for_current_day(data, text: str) -> str | None:
     hhmm = parse_time_hhmm(text)
@@ -483,7 +580,6 @@ def _set_time_for_current_day(data, text: str) -> str | None:
     data["schedule"]["pending_days"].pop(0)
     data["schedule"]["current_day"] = None
     return None
-
 
 def ob_summary(data: dict) -> str:
     sched = data.get("schedule") or {}
@@ -497,7 +593,6 @@ def ob_summary(data: dict) -> str:
         f"• *Rotina:* {describe_schedule(sched)}\n"
         "Responda *sim* para salvar, ou *não* para ajustar."
     )
-
 
 def ob_step(user, text: str) -> str:
     st = ob_state(user)
@@ -626,17 +721,14 @@ def ob_step(user, text: str) -> str:
     st["step"] = None
     return ob_start()
 
-
 # ------------------- Web -------------------
 @app.route("/admin/ping")
 def ping():
     return jsonify({"project": PROJECT_NAME, "ok": True}), 200
 
-
 def _curriculum_phase_title(day_idx: int) -> str:
     spec = _curriculum_spec(day_idx)
     return spec["phase"]
-
 
 @app.route("/bot", methods=["POST"])
 def bot_webhook():
@@ -693,6 +785,7 @@ def bot_webhook():
         title = (pend or {}).get("title", "-")
         phase = spec.get("phase", "-"); op = spec.get("op", "-")
         mode  = spec.get("mode", "-");  anchor = spec.get("anchor", "-")
+        model = spec.get("model", "-")
         round_str = f"{(pend or {}).get('round','-')}/{(pend or {}).get('rounds_total','-')}" if pend else "-"
         reply = (
             "🛠 *DEBUG*\n"
@@ -700,13 +793,14 @@ def bot_webhook():
             f"• pendência: {pend_flag}\n"
             f"• round: {round_str}\n"
             f"• title: {title}\n"
-            f"• spec: phase={phase} | op={op} | mode={mode} | anchor={anchor}"
+            f"• spec: phase={phase} | op={op} | mode={mode} | anchor={anchor} | model={model}"
         )
         return reply_twiml(reply)
 
     if low in {"reiniciar", "zerar", "resetar"}:
         user["curriculum"] = {"math_day": 1, "total_days": MAX_MATH_DAY}
         user["pending"].pop("mat_lote", None)
+        user["pending"].pop("math_models", None)
         db["users"][user_id] = user; save_db(db)
         return reply_twiml("🔁 Plano reiniciado. Envie *iniciar* para começar do *Dia 1* (Rodada 1).")
 
@@ -756,7 +850,6 @@ def bot_webhook():
         return reply_twiml("✍️ *Português* está desativado no momento. Continuaremos com *Matemática*.")
 
     return reply_twiml("Envie *iniciar* para começar a sessão do dia (*Matemática*).")
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
