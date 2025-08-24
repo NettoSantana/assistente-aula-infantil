@@ -669,7 +669,7 @@ def bot_webhook():
             "Para começar a atividade de hoje, envie *iniciar*.\n"
             f"Cada dia tem *{ROUNDS_PER_DAY} rodadas* de *10 exercícios*.\n"
             "Responda os resultados *separados por vírgula* ou envie *ok*.\n"
-            "Comandos: *iniciar*, *resposta X*, *ok*, *status*, *debug*, *reiniciar*."
+            "Comandos: *iniciar*, *resposta X*, *ok*, *status*, *debug*, *reiniciar*, *resetar*."
         )
         return reply_twiml(reply)
 
@@ -704,7 +704,7 @@ def bot_webhook():
         )
         return reply_twiml(reply)
 
-    if low in {"reiniciar", "zerar"}:
+    if low in {"reiniciar", "zerar", "resetar"}:
         user["curriculum"] = {"math_day": 1, "total_days": MAX_MATH_DAY}
         user["pending"].pop("mat_lote", None)
         db["users"][user_id] = user; save_db(db)
