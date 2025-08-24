@@ -130,32 +130,13 @@ def describe_schedule(sched: dict) -> str:
 def _curriculum_spec(day_idx: int):
     """
     Retorna {phase, op, mode, anchor} para o dia [1..60].
+    (A lógica de rounds agora força: soma → sub → mult → div → mista.)
     """
     if day_idx < 1: day_idx = 1
     if day_idx > MAX_MATH_DAY: day_idx = MAX_MATH_DAY
 
-    if 1 <= day_idx <= 10:
-        return {"phase": "A-Adição", "op": "soma", "mode": "direct", "anchor": day_idx}
-    if 11 <= day_idx <= 20:
-        return {"phase": "A-Adição", "op": "soma", "mode": "inv", "anchor": day_idx - 10}
-    if 21 <= day_idx <= 24:
-        return {"phase": "A-Adição", "op": "soma", "mode": "mix10", "anchor": None}
-
-    if 25 <= day_idx <= 34:
-        return {"phase": "B-Subtração", "op": "sub", "mode": "minuend", "anchor": day_idx - 14}
-    if 35 <= day_idx <= 38:
-        return {"phase": "B-Subtração", "op": "sub", "mode": "mix", "anchor": None}
-
-    if 39 <= day_idx <= 48:
-        return {"phase": "C-Multiplicação", "op": "mult", "mode": "direct", "anchor": day_idx - 38}
-    if 49 <= day_idx <= 58:
-        return {"phase": "C-Multiplicação", "op": "mult", "mode": "commute", "anchor": day_idx - 48}
-
-    # Fechamos no 60: só início de divisão
-    if 59 <= day_idx <= 60:
-        return {"phase": "D-Divisão", "op": "div", "mode": "divisor", "anchor": day_idx - 58}
-
-    return {"phase": "E-Encerrado", "op": "mix", "mode": "review", "anchor": None}
+    # fase "original" não importa muito, pois o round decide a operação do dia
+    return {"phase": "A-Adição", "op": "soma", "mode": "direct", "anchor": day_idx}
 
 def _module_label(op: str, etapa: int) -> str:
     labels = {"soma":"Soma","sub":"Subtração","mult":"Multiplicação","div":"Divisão","mix":"Revisão"}
@@ -163,32 +144,15 @@ def _module_label(op: str, etapa: int) -> str:
     return f"{labels.get(op, op.title())} {etapa} ({extra.get(op,'')})"
 
 # ---------- Modelos/variedade (ADIÇÃO) ----------
-# nomes de modelos: mix10_missing, direct_shuffled, missing_anchor, near_doubles, sort_results
 ADD_MODEL_TITLES = {
-    "mix10_missing": "Completar 10",
     "direct_shuffled": "Direta (embaralhada)",
-    "missing_anchor": "Faltou quanto? (+âncora)",
-    "near_doubles": "Mistão (dobros/quase-dobros)",
-    "sort_results": "Ordene os resultados",
 }
 
 def _models_for_day(op: str, day: int):
-    """
-    Para ADIÇÃO: planejamos modelos por rodada.
-    R1 e R2 sempre são “cálculo normal” (direta/inversa), mas variamos o estilo:
-      - dia%3==1: R1 direct_shuffled, R2 direct_shuffled
-      - dia%3==2: R1 missing_anchor , R2 direct_shuffled
-      - dia%3==0: R1 near_doubles   , R2 direct_shuffled
-    R3: completar 10
-    R4/R5: sem modelo (usamos Subtração mista e Revisão mista)
-    """
+    # Só usamos modelo na rodada 1 (adição) — uma variação sutil.
     if op != "soma":
         return None
-    if day % 3 == 1:
-        return ["direct_shuffled", "direct_shuffled", "mix10_missing", None, None]
-    if day % 3 == 2:
-        return ["missing_anchor", "direct_shuffled", "mix10_missing", None, None]
-    return ["near_doubles", "direct_shuffled", "mix10_missing", None, None]
+    return ["direct_shuffled", None, None, None, None]
 
 # ---------- Enunciado ----------
 def _format_math_prompt(batch):
@@ -291,6 +255,27 @@ def _gen_review_mix():
                [a//b for a,b in divs]
     return problems, answers
 
+# ---------- MISTA dinâmica pela âncora ----------
+def _gen_review_for_anchor(k: int):
+    k = max(1, int(k))
+    # 3 adições
+    adds = [(k,3),(k+1,2),(k+2,1)]
+    # 3 subtrações com minuend seguro
+    subs = [(min(20, k+10), 1),(min(20, k+10), 2),(min(20, k+10), 3)]
+    # 2 multiplicações
+    mult = [(k,2),(k,3)]
+    # 2 divisões
+    divs = [(k*2,k),(k*3,k)]
+    problems = [f"{a}+{b}" for a,b in adds] + \
+               [f"{a}-{b}" for a,b in subs] + \
+               [f"{a}x{b}" for a,b in mult] + \
+               [f"{a}/{b}" for a,b in divs]
+    answers  = [a+b for a,b in adds] + \
+               [a-b for a,b in subs] + \
+               [a*b for a,b in mult] + \
+               [a//b for a,b in divs]
+    return problems, answers
+
 # ---------- Geradores especiais (ADIÇÃO) ----------
 def _gen_add_direct_shuffled(anchor: int, mode: str):
     if mode == "inv":
@@ -323,47 +308,24 @@ def _gen_add_sort_results_set():
     answers  = sorted(sums)
     return problems, answers
 
-# ---------- Build do lote (com modelos para adição) ----------
+# ---------- Build do lote ----------
 def _build_batch_from_spec(spec: dict, *, model: str | None = None):
     phase = spec["phase"]; op = spec["op"]; mode = spec["mode"]; anchor = spec["anchor"]
 
-    # Adição com variedade de modelos
+    # Adição com modelo leve
     if op == "soma" and model:
         title = f"Matemática — {phase} · {ADD_MODEL_TITLES.get(model, model)}"
-        prompt_hint = None
-        prompt_example = None
-
-        if model == "mix10_missing":
-            p, a = _gen_add_missing_to_10()
-            prompt_hint = "Complete os espaços: responda apenas o *número que falta* em cada conta."
-            prompt_example = "Ex.: 9,8,7,6,5,4,3,2,1,0"
-        elif model == "direct_shuffled":
-            p, a = _gen_add_direct_shuffled(anchor or 1, mode)
-            prompt_hint = "Some e responda *os 10 resultados*, separados por vírgula."
-        elif model == "missing_anchor":
-            p, a = _gen_add_missing_anchor(anchor or 1)
-            prompt_hint = "Responda apenas o *número que falta* em: __ + k = alvo."
-        elif model == "near_doubles":
-            p, a = _gen_add_near_doubles()
-            prompt_hint = "Some mentalmente (dobros e quase-dobros) e responda os resultados."
-        elif model == "sort_results":
-            p, a = _gen_add_sort_results_set()
-            prompt_hint = "Calcule cada soma e responda *só os resultados em ordem crescente*."
-            prompt_example = "Ex.: 5,6,6,7,7,8,8,9,10,12"
-        else:
-            p, a = _gen_add_direct(anchor or 1)
-            prompt_hint = "Some e responda os resultados."
-
+        prompt_hint = "Some e responda *os 10 resultados*, separados por vírgula."
+        p, a = _gen_add_direct_shuffled(anchor or 1, mode)
         return {
             "problems": p,
             "answers": a,
             "title": title,
             "spec": {**spec, "model": model},
             "prompt_hint": prompt_hint,
-            "prompt_example": prompt_example
+            "prompt_example": None
         }
 
-    # Demais operações (mantém geração clássica)
     title = f"Matemática — {phase}"
     if op == "soma":
         if mode == "direct":
@@ -388,79 +350,46 @@ def _build_batch_from_spec(spec: dict, *, model: str | None = None):
         else:
             p,a = _gen_div_mix();            title += " · misto"
     else:
-        p,a = _gen_review_mix();             title += " · revisão"
+        # revisão dinâmica pela âncora (se vier None, usa 1)
+        p,a = _gen_review_for_anchor(anchor or 1); title += f" · revisão"
     return {"problems": p, "answers": a, "title": title, "spec": spec}
 
 # ---------- Avanço de âncora / Roteiro progressivo ----------
 def _spec_for_round(base_spec: dict, round_idx: int) -> dict:
     """
-    ROTEIRO PROGRESSIVO PARA ADIÇÃO (5 rodadas por dia):
-      1) soma direta (com âncora)
-      2) soma inversa (comutativa, com âncora)
-      3) completar 10
-      4) subtração mista (inclui “faltou quanto?”)
-      5) revisão mista (+, −, ×, ÷)
-    Demais fases mantêm o avanço clássico da âncora.
+    ROTEIRO PROGRESSIVO (5 rodadas fixas por dia):
+      1) Adição (direta)
+      2) Subtração (minuendo seguro)
+      3) Multiplicação (direta)
+      4) Divisão (por divisor)
+      5) Mista (+, −, ×, ÷) — dinâmica pela âncora
+    Âncora do dia = min(dia, 20) e é usada em todas as rodadas do dia.
     """
     spec = dict(base_spec)
-    op   = spec.get("op")
-    mode = spec.get("mode")
-    anchor = spec.get("anchor")
+    day_anchor = min(20, max(1, int(spec.get("anchor") or 1)))
 
-    # --- Roteiro especial para ADIÇÃO ---
-    if op == "soma":
-        # mapeia rodada -> (op, mode, usa_âncora)
-        plan = [
-            ("soma", "direct", True),   # R1
-            ("soma", "inv",    True),   # R2
-            ("soma", "mix10",  False),  # R3
-            ("sub",  "mix",    False),  # R4
-            ("mix",  "review", False),  # R5
-        ]
-        i = max(1, min(5, int(round_idx))) - 1
-        op2, mode2, uses_anchor = plan[i]
+    plan = [
+        ("soma", "direct",  day_anchor),                        # R1
+        ("sub",  "minuend", max(11, min(20, day_anchor + 10))), # R2  (minuendo 11..20)
+        ("mult", "direct",  day_anchor),                        # R3
+        ("div",  "divisor", day_anchor),                        # R4
+        ("mix",  "review",  day_anchor),                        # R5
+    ]
+    i = max(1, min(5, int(round_idx))) - 1
+    op2, mode2, a2 = plan[i]
 
-        phase_by_op = {
-            "soma": "A-Adição",
-            "sub":  "B-Subtração",
-            "mult": "C-Multiplicação",
-            "div":  "D-Divisão",
-            "mix":  "Revisão",
-        }
-
-        if uses_anchor:
-            # Para adição, mantemos âncora no intervalo 1..10 e avançamos por rodada
-            base_a = int(anchor or 1)
-            new_a = base_a + (int(round_idx) - 1)
-            new_a = max(1, min(10, new_a))
-            spec["anchor"] = new_a
-        else:
-            spec["anchor"] = None
-
-        spec["op"] = op2
-        spec["mode"] = mode2
-        spec["phase"] = phase_by_op.get(op2, "Revisão")
-        return spec
-
-    # --- Demais fases: avanço clássico da âncora ---
-    anchored_modes = {
-        ("soma", "direct"):  (1, 10),
-        ("soma", "inv"):     (1, 10),
-        ("sub",  "minuend"): (11, 20),
-        ("mult", "direct"):  (1, 10),
-        ("mult", "commute"): (1, 10),
-        ("div",  "divisor"): (1, 10),
+    phase_by_op = {
+        "soma": "A-Adição",
+        "sub":  "B-Subtração",
+        "mult": "C-Multiplicação",
+        "div":  "D-Divisão",
+        "mix":  "Revisão",
     }
 
-    if (op, mode) in anchored_modes:
-        min_a, max_a = anchored_modes[(op, mode)]
-        base_a = int(anchor or min_a)
-        new_a = base_a + (int(round_idx) - 1)
-        new_a = max(min_a, min(max_a, new_a))
-        spec["anchor"] = new_a
-    else:
-        spec["anchor"] = None
-
+    spec["op"]    = op2
+    spec["mode"]  = mode2
+    spec["anchor"]= a2
+    spec["phase"] = phase_by_op.get(op2, "Revisão")
     return spec
 
 def _apply_round_variation(batch: dict, round_idx: int):
@@ -477,10 +406,10 @@ def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
     day = max(1, min(MAX_MATH_DAY, int(day)))
     base_spec = _curriculum_spec(day)
 
-    # Planeja modelos do dia (somente Adição usa modelos nas R1-3)
+    # Planeja modelos do dia (só afeta Adição, R1)
     day_plan = user.get("pending", {}).get("math_models")
     if not day_plan or day_plan.get("day") != day:
-        models = _models_for_day(base_spec["op"], day)
+        models = _models_for_day("soma", day)
         if models:
             user.setdefault("pending", {})["math_models"] = {"day": day, "models": models}
         else:
@@ -494,7 +423,7 @@ def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
             model = models[idx]
 
     spec = _spec_for_round(base_spec, round_idx)
-    batch = _build_batch_from_spec(spec, model=model)
+    batch = _build_batch_from_spec(spec, model=(model if spec["op"] == "soma" else None))
     batch["day"] = day
     batch["round"] = round_idx
     batch["rounds_total"] = ROUNDS_PER_DAY
@@ -543,7 +472,6 @@ def _check_math_batch(user, text: str):
     user["pending"].pop("mat_lote", None)
 
     if round_idx < rounds_total:
-        # Próxima rodada no mesmo dia
         next_round = round_idx + 1
         batch2 = _start_math_batch_for_day(user, day, next_round)
         return True, f"✅ Rodada {round_idx}/{rounds_total} concluída! Vamos para a *Rodada {next_round}/{rounds_total}*.\n\n" + _format_math_prompt(batch2)
@@ -803,6 +731,8 @@ def bot_webhook():
         reply = (
             "Para começar a atividade de hoje, envie *iniciar*.\n"
             f"Cada dia tem *{ROUNDS_PER_DAY} rodadas* de *10 exercícios*.\n"
+            "Rodadas: 1) Adição  2) Subtração  3) Multiplicação  4) Divisão  5) Mista.\n"
+            "Os números progridem de 1 até 20 ao longo dos dias.\n"
             "Responda os resultados *separados por vírgula* ou envie *ok*.\n"
             "Comandos: *iniciar*, *resposta X*, *ok*, *status*, *debug*, *reiniciar*, *resetar*."
         )
@@ -869,7 +799,6 @@ def bot_webhook():
         return reply_twiml("📖 *Leitura* está desativada no momento. Siga com *Matemática*.")
 
     # -------- Respostas --------
-    # Se usuário manda 'ok' sem pendência, cria a do dia atual e continua
     if low in {"ok", "ok!", "ok."} and "mat_lote" not in user.get("pending", {}):
         day = int(user.get("curriculum",{}).get("math_day",1))
         if day > MAX_MATH_DAY:
