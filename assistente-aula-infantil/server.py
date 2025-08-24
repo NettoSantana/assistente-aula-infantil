@@ -157,7 +157,6 @@ def _curriculum_spec(day_idx: int):
 
     return {"phase": "E-Encerrado", "op": "mix", "mode": "review", "anchor": None}
 
-
 def _module_label(op: str, etapa: int) -> str:
     labels = {"soma":"Soma","sub":"Subtração","mult":"Multiplicação","div":"Divisão","mix":"Revisão"}
     extra = { "soma": f"+{etapa}", "sub": f"-{etapa}", "mult": f"×{etapa}", "div": f"÷{etapa}", "mix": "" }
@@ -173,16 +172,23 @@ ADD_MODEL_TITLES = {
     "sort_results": "Ordene os resultados",
 }
 
-def _add_models_base_order():
-    # ordem base para 5 rodadas; rotacionamos por dia p/ ficar variado entre dias
-    return ["mix10_missing", "direct_shuffled", "missing_anchor", "near_doubles", "sort_results"]
-
 def _models_for_day(op: str, day: int):
+    """
+    Para ADIÇÃO: planejamos modelos por rodada.
+    R1 e R2 sempre são “cálculo normal” (direta/inversa), mas variamos o estilo:
+      - dia%3==1: R1 direct_shuffled, R2 direct_shuffled
+      - dia%3==2: R1 missing_anchor , R2 direct_shuffled
+      - dia%3==0: R1 near_doubles   , R2 direct_shuffled
+    R3: completar 10
+    R4/R5: sem modelo (usamos Subtração mista e Revisão mista)
+    """
     if op != "soma":
         return None
-    base = _add_models_base_order()
-    rot = (day - 1) % len(base)
-    return base[rot:] + base[:rot]
+    if day % 3 == 1:
+        return ["direct_shuffled", "direct_shuffled", "mix10_missing", None, None]
+    if day % 3 == 2:
+        return ["missing_anchor", "direct_shuffled", "mix10_missing", None, None]
+    return ["near_doubles", "direct_shuffled", "mix10_missing", None, None]
 
 # ---------- Enunciado ----------
 def _format_math_prompt(batch):
@@ -291,18 +297,14 @@ def _gen_add_direct_shuffled(anchor: int, mode: str):
         probs, ans = _gen_add_inv(anchor)
     else:
         probs, ans = _gen_add_direct(anchor)
-    # rotação simples para embaralhar de forma determinística
-    # (a rotação final por rodada também acontece em _apply_round_variation)
     return probs, ans
 
 def _gen_add_missing_to_10():
-    # __ + a = 10, para a = 1..10  (respostas 9..0)
     problems = [f"__+{a}=10" for a in range(1, 11)]
     answers  = [10 - a for a in range(1, 11)]
     return problems, answers
 
 def _gen_add_missing_anchor(anchor: int):
-    # __ + anchor = target, target anchor+5..anchor+14
     targets = [anchor + i for i in range(5, 15)]
     problems = [f"__+{anchor}={t}" for t in targets]
     answers  = [t - anchor for t in targets]
@@ -349,7 +351,6 @@ def _build_batch_from_spec(spec: dict, *, model: str | None = None):
             prompt_hint = "Calcule cada soma e responda *só os resultados em ordem crescente*."
             prompt_example = "Ex.: 5,6,6,7,7,8,8,9,10,12"
         else:
-            # fallback para direta
             p, a = _gen_add_direct(anchor or 1)
             prompt_hint = "Some e responda os resultados."
 
@@ -390,34 +391,76 @@ def _build_batch_from_spec(spec: dict, *, model: str | None = None):
         p,a = _gen_review_mix();             title += " · revisão"
     return {"problems": p, "answers": a, "title": title, "spec": spec}
 
-# ---------- Avanço de âncora por rodada (5 etapas/dia) ----------
+# ---------- Avanço de âncora / Roteiro progressivo ----------
 def _spec_for_round(base_spec: dict, round_idx: int) -> dict:
     """
-    Para modos com âncora (adição direta/inversa, subtração minuendo,
-    multiplicação direta/comutativa, divisão por divisor), avança a âncora
-    em +(round_idx-1). Para modos sem âncora (mix/review), mantém.
-    Limita âncoras a faixas típicas por operação.
+    ROTEIRO PROGRESSIVO PARA ADIÇÃO (5 rodadas por dia):
+      1) soma direta (com âncora)
+      2) soma inversa (comutativa, com âncora)
+      3) completar 10
+      4) subtração mista (inclui “faltou quanto?”)
+      5) revisão mista (+, −, ×, ÷)
+    Demais fases mantêm o avanço clássico da âncora.
     """
     spec = dict(base_spec)
     op   = spec.get("op")
     mode = spec.get("mode")
     anchor = spec.get("anchor")
 
-    if anchor is None:
-        return spec  # mix/review
+    # --- Roteiro especial para ADIÇÃO ---
+    if op == "soma":
+        # mapeia rodada -> (op, mode, usa_âncora)
+        plan = [
+            ("soma", "direct", True),   # R1
+            ("soma", "inv",    True),   # R2
+            ("soma", "mix10",  False),  # R3
+            ("sub",  "mix",    False),  # R4
+            ("mix",  "review", False),  # R5
+        ]
+        i = max(1, min(5, int(round_idx))) - 1
+        op2, mode2, uses_anchor = plan[i]
 
+        phase_by_op = {
+            "soma": "A-Adição",
+            "sub":  "B-Subtração",
+            "mult": "C-Multiplicação",
+            "div":  "D-Divisão",
+            "mix":  "Revisão",
+        }
+
+        if uses_anchor:
+            # Para adição, mantemos âncora no intervalo 1..10 e avançamos por rodada
+            base_a = int(anchor or 1)
+            new_a = base_a + (int(round_idx) - 1)
+            new_a = max(1, min(10, new_a))
+            spec["anchor"] = new_a
+        else:
+            spec["anchor"] = None
+
+        spec["op"] = op2
+        spec["mode"] = mode2
+        spec["phase"] = phase_by_op.get(op2, "Revisão")
+        return spec
+
+    # --- Demais fases: avanço clássico da âncora ---
     anchored_modes = {
-        ("soma", "direct"): (1, 10),
-        ("soma", "inv"):    (1, 10),
+        ("soma", "direct"):  (1, 10),
+        ("soma", "inv"):     (1, 10),
         ("sub",  "minuend"): (11, 20),
-        ("mult", "direct"): (1, 10),
+        ("mult", "direct"):  (1, 10),
         ("mult", "commute"): (1, 10),
         ("div",  "divisor"): (1, 10),
     }
-    min_a, max_a = anchored_modes.get((op, mode), (anchor, anchor))
-    new_anchor = anchor + (round_idx - 1)
-    new_anchor = max(min_a, min(max_a, new_anchor))
-    spec["anchor"] = new_anchor
+
+    if (op, mode) in anchored_modes:
+        min_a, max_a = anchored_modes[(op, mode)]
+        base_a = int(anchor or min_a)
+        new_a = base_a + (int(round_idx) - 1)
+        new_a = max(min_a, min(max_a, new_a))
+        spec["anchor"] = new_a
+    else:
+        spec["anchor"] = None
+
     return spec
 
 def _apply_round_variation(batch: dict, round_idx: int):
@@ -434,7 +477,7 @@ def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
     day = max(1, min(MAX_MATH_DAY, int(day)))
     base_spec = _curriculum_spec(day)
 
-    # Escolha/planejamento de modelos do dia (apenas adição por enquanto)
+    # Planeja modelos do dia (somente Adição usa modelos nas R1-3)
     day_plan = user.get("pending", {}).get("math_models")
     if not day_plan or day_plan.get("day") != day:
         models = _models_for_day(base_spec["op"], day)
@@ -446,9 +489,9 @@ def _start_math_batch_for_day(user, day: int, round_idx: int = 1):
     model = None
     if user.get("pending", {}).get("math_models"):
         models = user["pending"]["math_models"]["models"]
-        # evita repetir modelo consecutivo (lista de 5 já sem repetição)
-        idx = (round_idx - 1) % len(models)
-        model = models[idx]
+        if models:
+            idx = (round_idx - 1) % len(models)
+            model = models[idx]
 
     spec = _spec_for_round(base_spec, round_idx)
     batch = _build_batch_from_spec(spec, model=model)
