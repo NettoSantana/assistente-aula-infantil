@@ -1,7 +1,8 @@
-# server.py — Assistente de Aula Infantil
+# tente-aula-infantil/server.py — Assistente de Aula Infantil
 # Onboarding "MARIA ANGELA" + Rotina por dia (seg–sáb obrig., dom opcional)
 # Fluxo: Matemática + Português (Leitura TEMPORARIAMENTE desativada)
 import os, re, itertools
+from typing import Optional, Dict, Any
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
 from progress import init_user_if_needed
@@ -36,7 +37,7 @@ def reply_twiml(text: str) -> Response:
 
 # ------------------- Util: telefones -------------------
 BR_DEFAULT_CC = "55"
-def normalize_phone(s: str) -> str | None:
+def normalize_phone(s: str) -> Optional[str]:
     if not s:
         return None
     x = re.sub(r"[^\d+]", "", s).strip()
@@ -50,7 +51,7 @@ def normalize_phone(s: str) -> str | None:
         return f"+{BR_DEFAULT_CC}{digits}"
     return None
 
-def mask_phone(p: str | None) -> str:
+def mask_phone(p: Optional[str]) -> str:
     if not p:
         return "não tem"
     d = re.sub(r"\D", "", p)
@@ -63,7 +64,7 @@ GRADE_MAP = {
     "infantil5": "Infantil 5 (Pré-II)",
     "1": "1º ano","2": "2º ano","3":"3º ano","4":"4º ano","5":"5º ano",
 }
-def parse_grade(txt: str) -> str | None:
+def parse_grade(txt: str) -> Optional[str]:
     t = (txt or "").lower().strip()
     if "infantil 4" in t or "pré-i" in t or "pre-i" in t: return GRADE_MAP["infantil4"]
     if "infantil 5" in t or "pré-ii" in t or "pre-ii" in t: return GRADE_MAP["infantil5"]
@@ -72,7 +73,7 @@ def parse_grade(txt: str) -> str | None:
     if t in {"1","2","3","4","5"}: return GRADE_MAP.get(t)
     return None
 
-def age_from_text(txt: str) -> int | None:
+def age_from_text(txt: str) -> Optional[int]:
     m = re.search(r"(\d{1,2})", txt or "")
     if not m: return None
     val = int(m.group(1))
@@ -97,13 +98,13 @@ PT2KEY = {
     "dom":"sun","domingo":"sun",
 }
 
-def parse_yes_no(txt: str) -> bool | None:
+def parse_yes_no(txt: str) -> Optional[bool]:
     t = (txt or "").strip().lower()
     if t in {"sim","s","yes","y"}: return True
     if t in {"não","nao","n","no"}: return False
     return None
 
-def parse_time_hhmm(txt: str) -> str | None:
+def parse_time_hhmm(txt: str) -> Optional[str]:
     t = (txt or "").strip().lower()
     t = t.replace("h", ":").replace(" ", "")
     t = t.replace("pm","p").replace("am","a")
@@ -246,7 +247,7 @@ def _gen_review_for_anchor(k: int):
     return problems, answers
 
 # ---------- Build do lote (Matemática) ----------
-def _build_batch_from_spec(spec: dict, *, model: str | None = None):
+def _build_batch_from_spec(spec: dict, *, model: Optional[str] = None):
     phase = spec["phase"]; op = spec["op"]; mode = spec["mode"]; anchor = spec["anchor"]
     title = f"Matemática — {phase}"
     if op == "soma":
@@ -609,7 +610,7 @@ def _prompt_for_next_day_time(data) -> str:
     label = DAYS_PT.get(day, day)
     return f"Qual *horário* para *{label}*? (ex.: 18:30, 19h, 7 pm) — faixa 05:00–21:30."
 
-def _set_time_for_current_day(data, text: str) -> str | None:
+def _set_time_for_current_day(data, text: str) -> Optional[str]:
     hhmm = parse_time_hhmm(text)
     if not hhmm:
         return "Horário inválido. Exemplos: *19:00*, *18h30*, *7 pm*. Faixa aceita: 05:00–21:30."
@@ -781,12 +782,17 @@ def bot_webhook():
     user.setdefault("pending", {})
     user.setdefault("profile", {})
     user.setdefault("onboarding", {"step": None, "data": {}})
+
     user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
     user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
-    user.setdefault("levels", {}).setdefault("matematica", 0)
-    user.setdefault("levels", {}).setdefault("portugues", 0)
-    user.setdefault("history", {}).setdefault("matematica", [])
-    user.setdefault("history", {}).setdefault("portugues", [])
+
+    levels = user.setdefault("levels", {})
+    levels.setdefault("matematica", 0)
+    levels.setdefault("portugues", 0)
+
+    history = user.setdefault("history", {})
+    history.setdefault("matematica", [])
+    history.setdefault("portugues", [])
 
     # -------- Onboarding primeiro --------
     if needs_onboarding(user):
