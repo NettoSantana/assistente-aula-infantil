@@ -25,9 +25,12 @@ _twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKE
 FEATURE_PORTUGUES = True
 FEATURE_LEITURA   = False
 
+# Sequência automática: após Matemática -> inicia Português; após Português -> fecha o dia
+AUTO_SEQUENCE_PT_AFTER_MATH = True
+
 MAX_MATH_DAY      = 60                                 # limite do plano de Matemática
-MAX_PT_DAY        = 60                                 # limite do plano de Português
-ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))      # 5 rodadas por dia, 10 exercícios cada
+MAX_PT_DAY        = 60                                  # limite do plano de Português
+ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))       # 5 rodadas por dia, 10 exercícios cada
 
 # ------------------- Util: TwiML -------------------
 def reply_twiml(text: str) -> Response:
@@ -373,8 +376,20 @@ def _check_math_batch(user, text: str):
         batch2 = _start_math_batch_for_day(user, day, next_round)
         return True, f"✅ Rodada {round_idx}/{rounds_total} concluída! Vamos para a *Rodada {next_round}/{rounds_total}*.\n\n" + _format_math_prompt(batch2)
 
-    # Fechou as rodadas → avança dia (até 60)
+    # Fechou as rodadas de MAT → registra nível e, se Português ativo, inicia PT do mesmo dia
     user["levels"]["matematica"] = user["levels"].get("matematica", 0) + 1
+
+    if FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH and not FEATURE_LEITURA:
+        # Garante PT no mesmo dia antes de avançar o dia
+        cur_pt = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
+        # Se PT estiver atrasado, sincroniza para o dia atual de MAT
+        if int(cur_pt.get("pt_day", 1)) < day:
+            cur_pt["pt_day"] = day
+        # Inicia PT do dia atual
+        batch2 = _start_pt_batch_for_day(user, day, 1)
+        return True, f"🎉 *Matemática do dia {day} concluída!* Agora vamos para *Português*.\n\n" + _format_pt_prompt(batch2)
+
+    # (fallback) Se PT não estiver ativo, avança direto o dia de Matemática
     cur = user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
     next_day = min(MAX_MATH_DAY, int(cur.get("math_day",1)) + 1)
     cur["math_day"] = next_day
@@ -552,17 +567,24 @@ def _check_pt_batch(user, text: str):
         batch2 = _start_pt_batch_for_day(user, day, next_round)
         return True, f"✅ Rodada {round_idx}/{rounds_total} (PT) concluída! Vamos para a *Rodada {next_round}/{rounds_total}*.\n\n" + _format_pt_prompt(batch2)
 
-    # última rodada do dia → avança dia PT
+    # Última rodada de PT: fecha o dia e só então avança *ambos* (MAT e PT)
     user["levels"]["portugues"] = user["levels"].get("portugues", 0) + 1
-    cur = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
-    next_day = min(MAX_PT_DAY, int(cur.get("pt_day",1)) + 1)
-    cur["pt_day"] = next_day
 
-    if day == MAX_PT_DAY and round_idx == rounds_total:
+    cur_pt  = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
+    cur_mat = user.setdefault("curriculum",   {"math_day": 1, "total_days": MAX_MATH_DAY})
+
+    current_day = int(pend.get("day", day))
+    next_day_pt  = min(MAX_PT_DAY,  current_day + 1)
+    next_day_mat = min(MAX_MATH_DAY, current_day + 1)
+
+    cur_pt["pt_day"]     = next_day_pt
+    cur_mat["math_day"]  = next_day_mat
+
+    if current_day == MAX_PT_DAY:
         return True, "🎉 *Parabéns!* Você concluiu o plano de Português até o final. Para recomeçar, envie *reiniciar pt*."
 
-    batch2 = _start_pt_batch_for_day(user, next_day, 1)
-    return True, f"🎉 *Parabéns!* Português do dia {day} concluído.\nAgora avançando para o *dia {next_day}*.\n\n" + _format_pt_prompt(batch2)
+    # Não abrimos automaticamente o próximo dia — finalizar o dia conforme pedido
+    return True, f"🎉 *Dia {current_day} concluído!* Amanhã seguimos com *Matemática do dia {next_day_mat}*. Envie *iniciar* quando quiser começar."
 
 # ============================================================
 # ==================== Onboarding (MA) =======================
@@ -747,7 +769,7 @@ def ob_step(user, text: str) -> str:
             user.setdefault("curriculum_pt",{"pt_day":   1, "total_days": MAX_PT_DAY})
             user["onboarding"] = {"step": None, "data": {}}
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
-                    "Envie *iniciar* (Matemática) ou *iniciar pt* (Português) para começar.")
+                    "Envie *iniciar* (Matemática). Após Matemática, *Português* abre automaticamente.")
         elif t in {"não","nao"}:
             return ("Sem problema! Você pode corrigir assim:\n"
                     "• *nome:* Ana Souza\n• *idade:* 7\n• *serie:* 2º ano\n"
@@ -808,8 +830,9 @@ def bot_webhook():
     # -------- Comandos --------
     if low in {"menu", "ajuda", "help"}:
         reply = (
-            "Para começar, envie *iniciar* (Matemática) ou *iniciar pt* (Português).\n"
+            "Para começar, envie *iniciar* (Matemática).\n"
             f"Cada dia tem *{ROUNDS_PER_DAY} rodadas* de *10 itens*.\n"
+            "Fluxo do dia: *Matemática* → (auto) *Português* → fim do dia. (*Leitura* desativada por enquanto.)\n"
             "MAT Rodadas: 1) Adição  2) Subtração  3) Multiplicação  4) Divisão  5) Mista.\n"
             "PT  Rodadas: 1) Som inicial  2) Sílabas  3) Decodificação  4) Ortografia  5) Leitura.\n"
             "Responda em *CSV* (separe por vírgulas) ou envie *ok* para pular e avançar.\n"
@@ -826,7 +849,8 @@ def bot_webhook():
         round_pt  = f"{pend_pt.get('round',1)}/{pend_pt.get('rounds_total',ROUNDS_PER_DAY)}" if pend_pt else "—"
         reply = (f"📊 *Status*\n"
                  f"• Matemática: dia {cur_day}/{MAX_MATH_DAY} | rodada {round_mat} | nível {user['levels']['matematica']} | feitos {len(user['history']['matematica'])}\n"
-                 f"• Português:  dia {cur_pt}/{MAX_PT_DAY} | rodada {round_pt} | nível {user['levels']['portugues']} | feitos {len(user['history']['portugues'])}")
+                 f"• Português:  dia {cur_pt}/{MAX_PT_DAY} | rodada {round_pt} | nível {user['levels']['portugues']} | feitos {len(user['history']['portugues'])}\n"
+                 f"• Sequência automática: {'ativa' if (FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH and not FEATURE_LEITURA) else 'inativa'}")
         return reply_twiml(reply)
 
     if low == "debug":
@@ -850,7 +874,8 @@ def bot_webhook():
             f"  spec: phase={phase} | op={op} | mode={mode} | anchor={anchor}\n"
             f"• PT  day: {cur_pt}/{MAX_PT_DAY} | pendência: {pend_ptflag} | round: {round_str_pt}\n"
             f"  title: {title_pt}\n"
-            f"  spec: {spec_pt}"
+            f"  spec: {spec_pt}\n"
+            f"• Auto PT após MAT: {'sim' if (FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH and not FEATURE_LEITURA) else 'não'}"
         )
         return reply_twiml(reply)
 
@@ -888,6 +913,7 @@ def bot_webhook():
             batch = user["pending"]["pt_lote"]
             db["users"][user_id] = user; save_db(db)
             return reply_twiml(_format_pt_prompt(batch))
+        # Manual: inicia PT no dia atual de PT (pode ficar diferente de MAT)
         day = int(user.get("curriculum_pt",{}).get("pt_day",1))
         if day > MAX_PT_DAY:
             return reply_twiml("✅ Você já concluiu o plano de *Português*. Envie *reiniciar pt* para começar de novo.")
@@ -928,7 +954,7 @@ def bot_webhook():
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg)
 
-    return reply_twiml("Envie *iniciar* (Matemática) ou *iniciar pt* (Português) para começar.")
+    return reply_twiml("Envie *iniciar* (Matemática). Após Matemática, *Português* abre automaticamente.")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
