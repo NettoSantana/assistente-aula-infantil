@@ -1,6 +1,5 @@
 ﻿feat(pt): ativa módulo Português e integra ao fluxo
 
-- FEATURE_PORTUGUES=True
 - comandos: iniciar pt, ok, resposta ...
 - PT: 5 rodadas/dia (som inicial, sílabas, decodificação, ortografia, leitura)
 - Temas rotativos: vogais, m/n, p/b, t/d, c/g (10 itens/rodada, CSV)
