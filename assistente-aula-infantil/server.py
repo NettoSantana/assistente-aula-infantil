@@ -1,11 +1,18 @@
 # tente-aula-infantil/server.py — Assistente de Aula Infantil
 # Onboarding "MARIA ANGELA" + Rotina por dia (seg–sáb obrig., dom opcional)
 # Fluxo: Matemática + Português (Leitura TEMPORARIAMENTE desativada)
-import os, re, itertools
-from typing import Optional, Dict, Any
+import os, re, itertools, random
+from typing import Optional, Dict, Any, Tuple
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
 from progress import init_user_if_needed
+
+# Tempo / fuso
+from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None
 
 # Twilio — resposta imediata
 from twilio.twiml.messaging_response import MessagingResponse
@@ -32,11 +39,39 @@ MAX_MATH_DAY      = 60                                 # limite do plano de Mate
 MAX_PT_DAY        = 60                                  # limite do plano de Português
 ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))       # 5 rodadas por *disciplina* por dia
 
+# ------------------- Motivação -------------------
+MOTIV_QUOTES = [
+    # Citações com autor
+    ("A disciplina é a ponte entre metas e conquistas.", "Jim Rohn"),
+    ("O sucesso é a soma de pequenos esforços repetidos dia após dia.", "Robert Collier"),
+    ("Persistência é o caminho do êxito.", "Charlie Chaplin"),
+    ("A prática não leva à perfeição; a prática consistente leva ao progresso.", "Autor desconhecido"),
+    ("A coragem é a resistência ao medo, o domínio do medo, não a ausência dele.", "Mark Twain"),
+    ("Você não precisa ser o melhor, só precisa ser melhor do que ontem.", "Autor desconhecido"),
+    # Originais (sem autor)
+    ("Disciplina é fazer o simples mesmo quando ninguém está vendo.", None),
+    ("Esforço hoje é confiança amanhã.", None),
+    ("Passinho a passinho, a montanha inteira se movimenta.", None),
+    ("Quem treina todo dia constrói músculos de mente.", None),
+]
+def pick_quote() -> str:
+    text, author = random.choice(MOTIV_QUOTES)
+    return f"“{text}”" + (f" — {author}" if author else "")
+
 # ------------------- Util: TwiML -------------------
 def reply_twiml(text: str) -> Response:
     r = MessagingResponse()
     r.message(text)
     return Response(str(r), mimetype="application/xml", status=200)
+
+def _send_sms(to: Optional[str], body: str) -> bool:
+    if not to or not _twilio_client or not TWILIO_FROM:
+        return False
+    try:
+        _twilio_client.messages.create(to=to, from_=TWILIO_FROM, body=body)
+        return True
+    except Exception:
+        return False
 
 # ------------------- Util: telefones -------------------
 BR_DEFAULT_CC = "55"
@@ -87,7 +122,7 @@ def first_name_from_profile(user) -> str:
     name = (user.get("profile", {}).get("child_name") or "").strip()
     return name.split()[0] if name else "aluno"
 
-# ------------------- Util: rotina (dias/horário por dia) -------------------
+# ------------------- Tempo / Rotina -------------------
 DEFAULT_DAYS = ["mon","tue","wed","thu","fri","sat"]
 DAY_ORDER    = ["mon","tue","wed","thu","fri","sat","sun"]
 DAYS_PT      = {"mon":"seg","tue":"ter","wed":"qua","thu":"qui","fri":"sex","sat":"sáb","sun":"dom"}
@@ -129,6 +164,44 @@ def describe_schedule(sched: dict) -> str:
         hhmm = times.get(d, "—")
         parts.append(f"{DAYS_PT.get(d,d)} {hhmm}")
     return " | ".join(parts)
+
+def _user_tz(user) -> ZoneInfo:
+    tzname = user.get("profile", {}).get("tz") or "America/Bahia"
+    if ZoneInfo:
+        try: return ZoneInfo(tzname)
+        except Exception: pass
+    # Fallback sem zoneinfo
+    return None
+
+def _now(user=None) -> datetime:
+    z = _user_tz(user) if user else None
+    return datetime.now(tz=z) if z else datetime.utcnow()
+
+def _today_key(user) -> str:
+    n = _now(user)
+    return n.strftime("%Y-%m-%d")
+
+def _weekday_key(user) -> str:
+    # 0=Mon ... 6=Sun -> "mon"... "sun"
+    w = (_now(user).weekday())  # 0..6
+    return ["mon","tue","wed","thu","fri","sat","sun"][w]
+
+def _scheduled_dt_today(user) -> Optional[datetime]:
+    prof = user.get("profile", {})
+    sched = prof.get("schedule") or {}
+    days = sched.get("days") or []
+    times = sched.get("times") or {}
+    key = _weekday_key(user)
+    if key not in days: return None
+    hhmm = times.get(key)
+    if not hhmm: return None
+    n = _now(user)
+    try:
+        hh, mm = map(int, hhmm.split(":"))
+        base = n.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return base
+    except Exception:
+        return None
 
 # ============================================================
 # =================== MATEMÁTICA (progressivo) ===============
@@ -518,6 +591,57 @@ def _start_pt_batch_for_day(user, day: int, round_idx: int = 1):
     user["pending"]["pt_lote"] = batch
     return batch
 
+# ---------- Aux: progresso do dia / relatórios ----------
+def _count_rounds_for_day(user, subject: str, day_num: int) -> int:
+    hist = user.get("history", {}).get(subject, []) or []
+    return sum(1 for h in hist if h.get("tipo") == "lote" and int(h.get("day", -1)) == int(day_num))
+
+def _guardians_list(user):
+    return (user.get("profile", {}).get("guardians") or [])[:2]
+
+def _child_phone(user) -> Optional[str]:
+    return user.get("profile", {}).get("child_phone")
+
+def _mini_report_text(user, day_num: int) -> str:
+    nome = first_name_from_profile(user).title()
+    today = _today_key(user)
+    mat = _count_rounds_for_day(user, "matematica", day_num)
+    pt  = _count_rounds_for_day(user, "portugues",  day_num)
+    quote = pick_quote()
+    return (f"✅ Relatório do dia ({today})\n"
+            f"{nome} *concluiu as atividades* de hoje.\n"
+            f"• Matemática: {mat}/5 rodadas\n"
+            f"• Português: {pt}/5 rodadas\n"
+            f"{quote}")
+
+def _incomplete_text(user, day_num: int) -> str:
+    nome = first_name_from_profile(user).title()
+    today = _today_key(user)
+    mat = _count_rounds_for_day(user, "matematica", day_num)
+    pt  = _count_rounds_for_day(user, "portugues",  day_num)
+    quote = pick_quote()
+    return (f"⚠️ Aviso ({today})\n"
+            f"{nome} *ainda não concluiu* as atividades de hoje.\n"
+            f"Progresso até agora — Matemática: {mat}/5 · Português: {pt}/5.\n"
+            f"Para retomar, responda *iniciar* no WhatsApp da criança.\n"
+            f"{quote}")
+
+def _prestart_text(user) -> str:
+    nome = first_name_from_profile(user).title()
+    quote = pick_quote()
+    return (f"⏰ {nome}, faltam *5 minutos* para começar o estudo de hoje!\n"
+            f"Separe lápis e caderno. Você vai arrasar!\n{quote}")
+
+# ---------- Flags do dia ----------
+def _flags(user) -> dict:
+    return user.setdefault("daily_flags", {})
+
+def _get_day_flags(user, date_key: Optional[str] = None) -> dict:
+    dk = date_key or _today_key(user)
+    fl = _flags(user)
+    return fl.setdefault(dk, {"prestart_sent": False, "incomplete_sent": False, "report_sent": False, "completed": False})
+
+# ------------------- Correção / avanço (Português) -------------------
 def _check_pt_batch(user, text: str):
     pend = user.get("pending", {}).get("pt_lote")
     if not pend:
@@ -573,6 +697,17 @@ def _check_pt_batch(user, text: str):
 
     cur_pt["pt_day"]     = next_day_pt
     cur_mat["math_day"]  = next_day_mat
+
+    # Marca concluído e dispara relatório imediato aos responsáveis
+    dk = _today_key(user)
+    dflags = _get_day_flags(user, dk)
+    dflags["completed"] = True
+    if not dflags.get("report_sent"):
+        # Envia relatório aos responsáveis
+        report = _mini_report_text(user, current_day)
+        for g in _guardians_list(user):
+            _send_sms(g, report)
+        dflags["report_sent"] = True
 
     if current_day == MAX_PT_DAY:
         return True, "🎉 *Parabéns!* Você concluiu o plano de Português até o final. Para recomeçar, envie *reiniciar pt*."
@@ -762,6 +897,7 @@ def ob_step(user, text: str) -> str:
             user.setdefault("curriculum",   {"math_day": 1, "total_days": MAX_MATH_DAY})
             user.setdefault("curriculum_pt",{"pt_day":   1, "total_days": MAX_PT_DAY})
             user["onboarding"] = {"step": None, "data": {}}
+            user.setdefault("daily_flags", {})
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
                     "Envie *iniciar* (Matemática). Após Matemática, *Português* abre automaticamente.")
         elif t in {"não","nao"}:
@@ -776,6 +912,53 @@ def ob_step(user, text: str) -> str:
 
     st["step"] = None
     return ob_start()
+
+# ------------------- Admin/Cron: lembretes -------------------
+def _cron_process(db) -> Dict[str, Any]:
+    sent = {"prestart":0, "incomplete":0}
+    for uid, user in (db.get("users") or {}).items():
+        # só se já tiver rotina definida
+        if needs_onboarding(user): 
+            continue
+        sched_dt = _scheduled_dt_today(user)
+        if not sched_dt:
+            continue
+        now = _now(user)
+        dk = _today_key(user)
+        f = _get_day_flags(user, dk)
+
+        # PRE-START (5 min antes)
+        if not f.get("prestart_sent"):
+            if now >= (sched_dt - timedelta(minutes=5)) and now < (sched_dt + timedelta(minutes=30)):
+                # manda pra criança, fallback pro 1º responsável
+                to = _child_phone(user) or ( _guardians_list(user)[0] if _guardians_list(user) else None )
+                if _send_sms(to, _prestart_text(user)):
+                    f["prestart_sent"] = True
+                    sent["prestart"] += 1
+
+        # INCOMPLETE (3h depois do horário)
+        if not f.get("incomplete_sent") and not f.get("completed"):
+            if now >= (sched_dt + timedelta(hours=3)):
+                # dia não finalizado → avisa responsáveis
+                day_num = int(user.get("curriculum",{}).get("math_day",1))
+                msg = _incomplete_text(user, day_num)
+                ok_any = False
+                for g in _guardians_list(user):
+                    if _send_sms(g, msg):
+                        ok_any = True
+                if ok_any:
+                    f["incomplete_sent"] = True
+                    sent["incomplete"] += 1
+        # salva flags atualizadas
+        db["users"][uid] = user
+    return sent
+
+@app.route("/admin/cron")
+def cron():
+    db = load_db()
+    stats = _cron_process(db)
+    save_db(db)
+    return jsonify({"ok": True, "sent": stats}), 200
 
 # ------------------- Web -------------------
 @app.route("/admin/ping")
@@ -810,6 +993,25 @@ def bot_webhook():
     history.setdefault("matematica", [])
     history.setdefault("portugues", [])
 
+    user.setdefault("daily_flags", {})
+
+    # -------- RESET TOTAL (#resetar) --------
+    if low == "#resetar":
+        # apaga tudo do usuário e volta para onboarding
+        fresh = {
+            "profile": {},
+            "onboarding": {"step": "name", "data": {}},
+            "pending": {},
+            "curriculum": {"math_day": 1, "total_days": MAX_MATH_DAY},
+            "curriculum_pt": {"pt_day": 1, "total_days": MAX_PT_DAY},
+            "levels": {"matematica": 0, "portugues": 0},
+            "history": {"matematica": [], "portugues": []},
+            "daily_flags": {}
+        }
+        db["users"][user_id] = fresh
+        save_db(db)
+        return reply_twiml("♻️ Tudo resetado. Vamos começar do zero.\n" + ob_start())
+
     # -------- Onboarding primeiro --------
     if needs_onboarding(user):
         st = user["onboarding"]
@@ -829,7 +1031,7 @@ def bot_webhook():
             "MAT Rodadas: 1) Adição  2) Subtração  3) Multiplicação  4) Divisão  5) Mista.\n"
             "PT  Rodadas: 1) Som inicial  2) Sílabas  3) Decodificação  4) Ortografia  5) Leitura.\n"
             "Responda em *CSV* (separe por vírgulas) ou envie *ok* para pular e avançar.\n"
-            "Comandos: *iniciar*, *iniciar pt*, *resposta ...*, *ok*, *status*, *debug*, *reiniciar*, *reiniciar pt*."
+            "Comandos: *iniciar*, *iniciar pt*, *resposta ...*, *ok*, *status*, *debug*, *reiniciar*, *reiniciar pt*, *#resetar*."
         )
         return reply_twiml(reply)
 
@@ -841,11 +1043,12 @@ def bot_webhook():
         round_mat = f"{pend.get('round',1)}/{pend.get('rounds_total',ROUNDS_PER_DAY)}" if pend else "—"
         round_pt  = f"{pend_pt.get('round',1)}/{pend_pt.get('rounds_total',ROUNDS_PER_DAY)}" if pend_pt else "—"
         etapa = "Português" if pend_pt else ("Matemática" if pend else "—")
+        flags = _get_day_flags(user)
         reply = (f"📊 *Status*\n"
                  f"• Matemática: dia {cur_day}/{MAX_MATH_DAY} | rodada {round_mat} | nível {user['levels']['matematica']} | feitos {len(user['history']['matematica'])}\n"
                  f"• Português:  dia {cur_pt}/{MAX_PT_DAY} | rodada {round_pt} | nível {user['levels']['portugues']} | feitos {len(user['history']['portugues'])}\n"
                  f"• Etapa do dia agora: {etapa}\n"
-                 f"• Sequência automática: {'ativa' if (FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH and not FEATURE_LEITURA) else 'inativa'}")
+                 f"• Lembretes hoje — prestart: {'sim' if flags.get('prestart_sent') else 'não'}, incompleto: {'sim' if flags.get('incomplete_sent') else 'não'}, relatório: {'sim' if flags.get('report_sent') else 'não'}")
         return reply_twiml(reply)
 
     if low == "debug":
@@ -862,6 +1065,8 @@ def bot_webhook():
         round_str = f"{(pend or {}).get('round','-')}/{(pend or {}).get('rounds_total','-')}" if pend else "-"
         round_str_pt = f"{(pend_pt or {}).get('round','-')}/{(pend_pt or {}).get('rounds_total','-')}" if pend_pt else "-"
         phase = spec.get("phase","-"); op = spec.get("op","-"); mode = spec.get("mode","-"); anchor = spec.get("anchor","-")
+        sched_dt = _scheduled_dt_today(user)
+        flags = _get_day_flags(user)
         reply = (
             "🛠 *DEBUG*\n"
             f"• MAT day: {cur_day}/{MAX_MATH_DAY} | pendência: {pend_flag} | round: {round_str}\n"
@@ -870,6 +1075,8 @@ def bot_webhook():
             f"• PT  day: {cur_pt}/{MAX_PT_DAY} | pendência: {pend_ptflag} | round: {round_str_pt}\n"
             f"  title: {title_pt}\n"
             f"  spec: {spec_pt}\n"
+            f"• Hoje agendado: {sched_dt}\n"
+            f"• Flags: {flags}\n"
             f"• Auto PT após MAT: {'sim' if (FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH and not FEATURE_LEITURA) else 'não'}"
         )
         return reply_twiml(reply)
@@ -888,7 +1095,7 @@ def bot_webhook():
 
     # -------- Iniciar sessões --------
     if low == "iniciar":
-        # Se PT está pendente, prioriza PT (não deixa reabrir MAT e quebrar a sequência 5+5)
+        # Se PT está pendente, prioriza PT
         if "pt_lote" in user.get("pending", {}):
             batch = user["pending"]["pt_lote"]
             db["users"][user_id] = user; save_db(db)
@@ -907,7 +1114,6 @@ def bot_webhook():
         return reply_twiml(saudacao + "\n\n" + _format_math_prompt(batch))
 
     if low in {"iniciar pt","pt iniciar","iniciar português","iniciar portugues"}:
-        # Se MAT está pendente, prioriza MAT (não deixa pular antes de fechar as 5 de MAT)
         if "mat_lote" in user.get("pending", {}):
             batch = user["pending"]["mat_lote"]
             db["users"][user_id] = user; save_db(db)
@@ -918,7 +1124,6 @@ def bot_webhook():
             batch = user["pending"]["pt_lote"]
             db["users"][user_id] = user; save_db(db)
             return reply_twiml(_format_pt_prompt(batch))
-        # Manual: inicia PT no dia atual de PT (pode ficar diferente de MAT se usuário quiser)
         day = int(user.get("curriculum_pt",{}).get("pt_day",1))
         if day > MAX_PT_DAY:
             return reply_twiml("✅ Você já concluiu o plano de *Português*. Envie *reiniciar pt* para começar de novo.")
