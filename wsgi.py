@@ -1,12 +1,11 @@
-﻿from pathlib import Path
-import sys, runpy
+﻿import importlib.util, os, sys
 
-BASE = Path(__file__).parent
-PKG_DIR = BASE / "assistente-aula-infantil"
-SERVER = PKG_DIR / "server.py"
+BASE_DIR = os.path.dirname(__file__)
+SERVER_PATH = os.path.join(BASE_DIR, 'assistente-aula-infantil', 'server.py')
 
-# garante que storage.py / progress.py sejam importáveis
-sys.path.insert(0, str(PKG_DIR))
+spec = importlib.util.spec_from_file_location('server', SERVER_PATH)
+module = importlib.util.module_from_spec(spec)
+sys.modules['server'] = module
+spec.loader.exec_module(module)
 
-ns = runpy.run_path(str(SERVER))
-app = ns["app"]
+app = getattr(module, 'app')
