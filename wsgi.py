@@ -1,8 +1,6 @@
 import os, sys
-
-BASE = os.path.dirname(__file__)
-SYS_PATH = os.path.join(BASE, "assistente-aula-infantil")
-if SYS_PATH not in sys.path:
-    sys.path.insert(0, SYS_PATH)
-
-from server import app  # <- ESTA ? a WSGI app
+BASE_DIR = os.path.dirname(__file__)
+APP_DIR = os.path.join(BASE_DIR, "assistente-aula-infantil")
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+from server import app
