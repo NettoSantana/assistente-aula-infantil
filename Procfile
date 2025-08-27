@@ -1,1 +1,1 @@
-web: sh -c 'cd assistente-aula-infantil && exec waitress-serve --host=0.0.0.0 --port= server:app'
+web: PYTHONPATH=assistente-aula-infantil waitress-serve --host=0.0.0.0 --port=$PORT server:app
