@@ -1,1 +1,1 @@
-web: cd assistente-aula-infantil && waitress-serve --host=0.0.0.0 --port=$PORT wsgi:app
+web: PYTHONPATH=assistente-aula-infantil waitress-serve --host=0.0.0.0 --port=$PORT server:app
