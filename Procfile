@@ -1,1 +1,1 @@
-﻿web: waitress-serve --host=0.0.0.0 --port=$PORT wsgi:app
+web: cd assistente-aula-infantil && waitress-serve --host=0.0.0.0 --port=$PORT wsgi:app
