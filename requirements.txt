@@ -1,6 +1,4 @@
-﻿@'
-flask
+﻿flask
 twilio
 python-dotenv
 waitress
-'@ | Set-Content -Encoding utf8 .\requirements.txt
