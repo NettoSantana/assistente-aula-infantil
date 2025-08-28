@@ -4,6 +4,7 @@
 # Fluxo diário: Matemática (5) -> Português (5) -> Leitura (3 páginas) -> fecha o dia e notifica responsáveis.
 
 import os, re, random, tempfile, shutil
+import subprocess  # NEW: fallback com ffprobe
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
@@ -671,44 +672,121 @@ def _score_from_seconds(sec: float) -> float:
     base = 6.0 + max(0.0, (sec - MIN_AUDIO_SEC)) / 6.0
     return min(10.0, base)
 
+# NEW: fallback com ffprobe
+def _probe_duration_ffprobe(fpath: str) -> Optional[float]:
+    """Tenta medir duração via ffprobe (se ffmpeg estiver instalado)."""
+    try:
+        if not shutil.which("ffprobe"):
+            return None
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                fpath,
+            ],
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            universal_newlines=True,
+        ).strip()
+        val = float(out)
+        return val if val > 0 else None
+    except Exception:
+        return None
+
 def _handle_audio_submission(user, payload) -> Optional[str]:
     """Processa áudio quando estamos aguardando (via Twilio WhatsApp)."""
     st = _reading_state(user)
     if not st.get("awaiting_audio"):
         return None
+
     num_media = int(payload.get("NumMedia", "0") or "0")
     if num_media < 1:
         return "Envie o *áudio* (nota por duração)."
+
+    # Aceita tipos 'audio/*' e alguns que chegam como video/ogg, webm ou application/ogg
     media_url = None
     ctype = None
     for i in range(num_media):
-        ct = payload.get(f"MediaContentType{i}")
-        if ct and ct.startswith("audio"):
-            media_url = payload.get(f"MediaUrl{i}")
+        ct = (payload.get(f"MediaContentType{i}") or "").lower()
+        url = payload.get(f"MediaUrl{i}")
+        if not ct or not url:
+            continue
+        is_audioish = (
+            ct.startswith("audio")
+            or ct in {"video/ogg", "video/webm", "application/ogg", "application/octet-stream"}
+        )
+        if is_audioish:
+            media_url = url
             ctype = ct
             break
+
     if not media_url:
         return "Anexo recebido, mas não é áudio. Envie um *áudio* de resumo (≥ 60s)."
 
+    # Baixa o arquivo com auth da Twilio
     try:
         resp = requests.get(media_url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=20)
         resp.raise_for_status()
     except Exception:
         return "Não consegui baixar o áudio. Tente reenviar."
 
+    # Mapeia extensões de forma mais ampla
+    ext_map = {
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/ogg": ".ogg",
+        "audio/ogg; codecs=opus": ".ogg",
+        "application/ogg": ".ogg",
+        "audio/opus": ".opus",
+        "audio/aac": ".m4a",
+        "audio/mp4": ".m4a",
+        "audio/m4a": ".m4a",
+        "audio/3gpp": ".3gp",
+        "audio/amr": ".amr",
+        "audio/webm": ".webm",
+        "video/ogg": ".ogg",
+        "video/webm": ".webm",
+        "application/octet-stream": ".bin",
+    }
+
     tmpdir = tempfile.mkdtemp()
     try:
-        ext = ".bin"
-        if ctype and "/" in ctype:
+        ext = ext_map.get(ctype or "", ".bin")
+        if ext == ".bin" and (ctype or "").startswith("audio/") and "/" in (ctype or ""):
             ext = "." + ctype.split("/")[1].split(";")[0]
+
         fpath = os.path.join(tmpdir, f"audio{ext}")
         with open(fpath, "wb") as f:
             f.write(resp.content)
 
-        au = MutagenFile(fpath)
-        if not au or not getattr(au, "info", None) or not getattr(au.info, "length", None):
-            return "Não consegui ler a duração do áudio. Regrave em *ogg/mp3/m4a*."
-        sec = float(au.info.length)
+        # 1ª tentativa: mutagen
+        sec = None
+        try:
+            au = MutagenFile(fpath)
+            if au and getattr(au, "info", None) and getattr(au.info, "length", None):
+                sec = float(au.info.length)
+        except Exception:
+            sec = None
+
+        # 2ª tentativa: ffprobe (se disponível)
+        if not sec:
+            sec = _probe_duration_ffprobe(fpath)
+
+        # 3ª tentativa: algum campo de duração no webhook (se existir)
+        if not sec:
+            mdur = payload.get("MediaDuration0") or payload.get("MediaDuration")
+            try:
+                if mdur:
+                    val = float(mdur)
+                    sec = val / 1000.0 if val > 1000 else val
+            except Exception:
+                pass
+
+        if not sec or sec <= 0:
+            return (f"Não consegui ler a duração do áudio (tipo: {ctype or 'desconhecido'}).\n"
+                    "Reenvie como *arquivo de áudio* em *OGG/MP3/M4A* (evite WEBM/3GP) "
+                    "ou grave como *mensagem de voz* padrão do WhatsApp.")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
