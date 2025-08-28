@@ -73,7 +73,6 @@ def _ensure_books_dir():
         src = os.path.join(here, "books")
         dst = BOOKS_DIR
         os.makedirs(dst, exist_ok=True)
-        # Se src e dst são a MESMA pasta, não há o que copiar
         if os.path.abspath(src) == os.path.abspath(dst):
             return
         if os.path.isdir(src):
@@ -84,7 +83,6 @@ def _ensure_books_dir():
                     if not os.path.exists(d):
                         shutil.copyfile(s, d)
     except Exception:
-        # Evita travar startup por conta de cópia
         pass
 
 # Garante que /data/books (se existir) receba os PDFs do repo
@@ -499,6 +497,7 @@ def _reading_state(user) -> Dict[str, Any]:
         "cursor": None,
         "last_pages": None,
         "awaiting_audio": False,
+        "menu": [],  # lista de arquivos mostrados por último para seleção numérica
     })
 
 def _list_books() -> List[str]:
@@ -525,7 +524,6 @@ def _extract_text_len(reader: PdfReader, page_index: int) -> int:
     try:
         t = reader.pages[page_index].extract_text() or ""
         t = t.strip()
-        # evita páginas com só números/índice
         if any(k in t.upper() for k in READ_KEYWORDS): return 0
         return len(re.sub(r"\s+", " ", t))
     except Exception:
@@ -540,7 +538,7 @@ def _suggest_start_page(path: str) -> int:
         for i in range(0, max_probe):
             L = _extract_text_len(reader, i)
             if L >= MIN_TEXT_CHARS:
-                best = i + 1  # páginas são 1-based para o usuário
+                best = i + 1
                 break
         return best
 
@@ -561,46 +559,74 @@ def _format_reading_prompt(pages: Tuple[int,int,int], book: str) -> str:
             f"Grave *1 áudio* com *≥ {MIN_AUDIO_SEC}s* resumindo o que leu nessas páginas.\n"
             f"Critério: nota > {int(PASS_MIN_SCORE)} para passar. Envie apenas o áudio.")
 
+def _reading_book_in_progress(st) -> bool:
+    if not st.get("selected_book"): return False
+    cur = int(st.get("cursor") or 0)
+    tot = int(st.get("total_pages") or 0)
+    return bool(cur and tot and cur <= tot)
+
+def _lock_msg(st) -> str:
+    return (f"🔒 Você já está lendo *{st.get('selected_book')}* "
+            f"(pág {int(st.get('cursor') or 0)}/{int(st.get('total_pages') or 0)}).\n"
+            f"Só pode escolher outro livro quando *concluir este*. "
+            f"Para continuar, envie *iniciar leitura*.")
+
+def _reading_menu_text(user) -> str:
+    _ensure_books_dir()
+    files = _list_books()
+    st = _reading_state(user)
+    st["menu"] = files
+    if not files:
+        return f"📚 Nenhum PDF encontrado em *{BOOKS_DIR}*. Suba os livros e tente de novo."
+    lines = [f"{i+1}) {nm}" for i, nm in enumerate(files[:30])]
+    tail = "" if len(files) <= 30 else f"\n… ({len(files)-30} mais)"
+    return "📚 *Escolha um livro (digite o número):*\n" + "\n".join(lines) + tail + "\n\nUse: *escolher <número>*"
+
 def _reading_start_for_user(user) -> str:
     st = _reading_state(user)
     book = st.get("selected_book")
     if not book:
-        # garante que (em produção) os PDFs do repo foram copiados para /data/books
-        _ensure_books_dir()
-        files = _list_books()
-        if not files:
-            return ("📚 Nenhum livro encontrado.\n"
-                    f"Envie PDFs para *{BOOKS_DIR}* e depois use *livros* / *escolher livro <nome.pdf>*.")
-        li = "\n".join(f"- {x}" for x in files[:12])
-        return ("📚 Escolha um livro primeiro:\n" + li +
-                "\n\nUse: *escolher livro <nome.pdf>*\n"
-                "Se precisar ajustar a página inicial útil: *inicio <n>*")
+        return _reading_menu_text(user)
     pages = _pick_next_pages(user)
     if not pages:
-        return "Este livro parece concluído. Escolha outro com *escolher livro <nome.pdf>*."
+        return "📘 Este livro foi concluído! Envie *livros* para escolher outro."
     st["awaiting_audio"] = True
     st["last_pages"] = list(pages)
     return _format_reading_prompt(pages, book)
 
-def _reading_select_book(user, name: str) -> str:
-    # aceita nome exato, case-insensitive ou parte do nome (se único)
-    def _resolve_name(nm: str) -> Optional[str]:
-        files = _list_books()
-        if not files: return None
-        nm_l = nm.lower().strip()
-        for f in files:
-            if f.lower() == nm_l:
-                return f
-        cand = [f for f in files if nm_l in f.lower()]
-        return cand[0] if len(cand) == 1 else None
+def _reading_select_book(user, name_or_pattern: str) -> str:
+    st = _reading_state(user)
+    if _reading_book_in_progress(st):
+        return _lock_msg(st)
 
-    resolved = _resolve_name(name) or name
+    # aceita nome exato/substring (compat) OU índice numérico
+    files = _list_books()
+    if not files:
+        return f"📚 Nenhum PDF encontrado em *{BOOKS_DIR}*."
+
+    # índice?
+    mnum = re.fullmatch(r"\d{1,3}", name_or_pattern.strip())
+    if mnum:
+        idx = int(mnum.group(0))
+        if not (1 <= idx <= len(files)):
+            return "Número inválido. Envie *livros* para ver a lista numerada novamente."
+        resolved = files[idx-1]
+    else:
+        query = name_or_pattern.strip().lower()
+        exact = next((f for f in files if f.lower() == query), None)
+        if exact:
+            resolved = exact
+        else:
+            cand = [f for f in files if query in f.lower()]
+            if len(cand) != 1:
+                return "Livro não encontrado ou ambíguo. Envie *livros* e escolha por número (ex.: *escolher 1*)."
+            resolved = cand[0]
+
     path = _book_path(resolved)
     if not path:
-        return "Livro não encontrado. Use *livros* para listar e *escolher livro <nome.pdf>*."
+        return "Livro não encontrado. Envie *livros* e escolha por número."
     tot = _pdf_total_pages(path)
     start = _suggest_start_page(path)
-    st = _reading_state(user)
     st.update({
         "selected_book": os.path.basename(resolved),
         "total_pages": tot,
@@ -610,14 +636,14 @@ def _reading_select_book(user, name: str) -> str:
         "awaiting_audio": False,
     })
     return (f"📚 Livro selecionado: *{os.path.basename(resolved)}* ({tot} páginas).\n"
-            f"Sugestão de início: *página {start}* (auto-detecção).\n"
+            f"Sugestão de início: *página {start}*.\n"
             f"Se quiser alterar: *inicio <n>*.\n"
             f"Quando quiser começar: *iniciar leitura*.")
 
 def _reading_set_start(user, n: int) -> str:
     st = _reading_state(user)
     if not st.get("selected_book"):
-        return "Escolha um livro antes. Use *livros* / *escolher livro <nome.pdf>*."
+        return "Escolha um livro antes. Envie *livros* e depois *escolher <número>*."
     n = max(1, int(n))
     n = min(n, int(st.get("total_pages") or n))
     st["start_page"] = n
@@ -637,12 +663,11 @@ def _reading_register_result(user, pages: Tuple[int,int,int], seconds: float, sc
         "book": _reading_state(user).get("selected_book"),
         "day": day_num,
     })
-    # simples incremento de nível
     user.setdefault("levels", {}).setdefault("leitura", 0)
     user["levels"]["leitura"] += 1
 
 def _score_from_seconds(sec: float) -> float:
-    # Base simples por duração: 60s = 6, +1 ponto a cada 6s extra, teto 10
+    # 60s = 6; +1 pto a cada 6s extra; teto 10
     base = 6.0 + max(0.0, (sec - MIN_AUDIO_SEC)) / 6.0
     return min(10.0, base)
 
@@ -654,7 +679,6 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
     num_media = int(payload.get("NumMedia", "0") or "0")
     if num_media < 1:
         return "Envie o *áudio* (nota por duração)."
-    # Pega o primeiro áudio
     media_url = None
     ctype = None
     for i in range(num_media):
@@ -666,7 +690,6 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
     if not media_url:
         return "Anexo recebido, mas não é áudio. Envie um *áudio* de resumo (≥ 60s)."
 
-    # Baixa o arquivo com auth da Twilio
     try:
         resp = requests.get(media_url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=20)
         resp.raise_for_status()
@@ -707,8 +730,9 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
     # Aprovado
     day = int(user.get("curriculum_pt",{}).get("pt_day", user.get("curriculum",{}).get("math_day",1)))
     _reading_register_result(user, pages, sec, score, day)
-    # avança cursor
-    st["cursor"] = min(int(st["cursor"] or 1) + 3, int(st["total_pages"] or 1))
+
+    # avança cursor (+3 sem 'min' para permitir finalizar o livro)
+    st["cursor"] = int(st["cursor"] or 1) + 3
     st["awaiting_audio"] = False
     st["last_pages"] = None
 
@@ -721,10 +745,14 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
     cur_mat["math_day"] = min(MAX_MATH_DAY, next_day)
     _close_day_and_notify(user, current_day)
 
+    tail = ""
+    if int(st.get("cursor") or 0) > int(st.get("total_pages") or 0):
+        tail = "\n📘 *Livro concluído!* Para escolher outro: envie *livros* e depois *escolher <número>*."
+
     return (f"✅ *Leitura concluída!* Páginas *{p1}–{p3}*.\n"
             f"Áudio: *{sec_i}s* → Nota *{score:.1f}/10*.\n"
-            f"📅 *Dia {current_day} fechado.* Amanhã seguimos com a Matemática do dia {next_day}.\n"
-            f"Se quiser continuar o mesmo livro depois, é só enviar *iniciar leitura*.")
+            f"📅 *Dia {current_day} fechado.* Amanhã seguimos com a Matemática do dia {next_day}."
+            f"{tail}")
 
 # ------------------- Correção / avanço (Matemática) -------------------
 def _check_math_batch(user, text: str):
@@ -770,14 +798,12 @@ def _check_math_batch(user, text: str):
     user["levels"]["matematica"] = user["levels"].get("matematica", 0) + 1
 
     if FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH:
-        # sincroniza PT com o dia atual e abre PT rodada 1
         user["pending"].pop("pt_lote", None)
         cur_pt = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
         cur_pt["pt_day"] = day
         batch2 = _start_pt_batch_for_day(user, day, 1)
         return True, f"🎉 *Matemática do dia {day} concluída!* Agora vamos para *Português* (5 rodadas).\n\n" + _format_pt_prompt(batch2)
 
-    # (fallback) Se PT não ativo, fecha dia
     _close_day_and_notify(user, day)
     cur = user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
     next_day = min(MAX_MATH_DAY, int(cur.get("math_day",1)) + 1)
@@ -827,17 +853,14 @@ def _check_pt_batch(user, text: str):
         batch2 = _start_pt_batch_for_day(user, day, next_round)
         return True, f"✅ Rodada {round_idx}/{rounds_total} (PT) concluída! Vamos para a *Rodada {next_round}/{rounds_total}*.\n\n" + _format_pt_prompt(batch2)
 
-    # Última rodada de PT → se LEITURA ativa, inicia leitura; senão fecha o dia
     user["levels"]["portugues"] = user["levels"].get("portugues", 0) + 1
 
     if FEATURE_LEITURA and AUTO_SEQUENCE_READ_AFTER_PT:
-        # garante estruturas de histórico/nível de leitura
         user.setdefault("history", {}).setdefault("leitura", [])
         user.setdefault("levels", {}).setdefault("leitura", 0)
         msg = _reading_start_for_user(user)
         return True, f"🎉 *Português do dia {day} concluído!* Agora vamos para *Leitura*.\n\n{msg}"
 
-    # Sem leitura → fechar dia
     cur_pt  = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
     cur_mat = user.setdefault("curriculum",   {"math_day": 1, "total_days": MAX_MATH_DAY})
     current_day = int(pend.get("day", day))
@@ -930,7 +953,7 @@ def ob_step(user, text: str) -> str:
             if not g: return "Não reconheci a *série/ano*. Exemplos: *Infantil 4*, *1º ano*, *3º ano*."
             data["grade"] = g
         elif field in {"crianca","criança"}:
-            data["child_phone"] = normalize_phone(val)  # cadastra, mas nunca enviaremos p/ a criança
+            data["child_phone"] = normalize_phone(val)
         elif field in {"pais","pais/responsaveis"}:
             nums = [normalize_phone(x) for x in val.split(",")]
             nums = [n for n in nums if n]
@@ -1020,7 +1043,7 @@ def ob_step(user, text: str) -> str:
             prof["child_name"]  = data.get("child_name")
             prof["age"]         = data.get("age")
             prof["grade"]       = data.get("grade")
-            prof["child_phone"] = data.get("child_phone")  # cadastrado, mas não usamos pra envio
+            prof["child_phone"] = data.get("child_phone")
             prof["guardians"]   = data.get("guardians", [])
             prof.setdefault("tz", "America/Bahia")
             sched = data.get("schedule", {})
@@ -1080,7 +1103,7 @@ def bot_webhook():
     history.setdefault("portugues", [])
     history.setdefault("leitura", [])
 
-    user.setdefault("daily_flags", {})  # só usamos report_sent/completed
+    user.setdefault("daily_flags", {})
 
     # -------- RESET TOTAL (#resetar) --------
     if low == "#resetar":
@@ -1096,7 +1119,8 @@ def bot_webhook():
             "reading": {
                 "selected_book": None, "total_pages": 0,
                 "start_page": None, "cursor": None,
-                "last_pages": None, "awaiting_audio": False
+                "last_pages": None, "awaiting_audio": False,
+                "menu": []
             }
         }
         db["users"][user_id] = fresh
@@ -1122,25 +1146,39 @@ def bot_webhook():
             "PT : 1) Som inicial  2) Sílabas  3) Decodificação  4) Ortografia  5) Leitura.\n"
             f"LEITURA: escolha 1 PDF ({BOOKS_DIR}), 3 páginas sequenciais por sessão, áudio ≥ {MIN_AUDIO_SEC}s, nota > 8.\n\n"
             "Responda em *CSV* (vírgulas) nos módulos de MAT/PT ou envie *ok* para pular.\n"
-            "Comandos: *iniciar*, *iniciar pt*, *iniciar leitura*, *livros*, *escolher livro <nome.pdf>*, *inicio <n>*, "
+            "Comandos: *iniciar*, *iniciar pt*, *iniciar leitura*, *livros*, *escolher <número>*, *inicio <n>*, "
             "*resposta ...*, *ok*, *status*, *debug*, *reiniciar*, *reiniciar pt*, *#resetar*."
         )
         return reply_twiml(reply)
 
-    # LEITURA — utilitários/controle
-    if low == "livros":
-        # garante sincronização (repo -> /data/books) em produção
-        _ensure_books_dir()
-        files = _list_books()
-        if not files:
-            return reply_twiml(f"📚 Nenhum PDF encontrado em *{BOOKS_DIR}*. Suba os livros e tente de novo.")
-        li = "\n".join(f"- {x}" for x in files[:30])
-        tail = "" if len(files) <= 30 else f"\n… ({len(files)-30} mais)"
-        return reply_twiml("📚 *Livros disponíveis:*\n" + li + tail + "\n\nUse: *escolher livro <nome.pdf>*")
+    # ========== LEITURA — utilitários/controle ==========
+    st_read = _reading_state(user)
 
-    m_sel = re.match(r"^escolher\s+livro\s+(.+)$", low)
-    if m_sel:
-        name = m_sel.group(1).strip()
+    if low == "livros":
+        msg = _reading_menu_text(user)
+        db["users"][user_id] = user; save_db(db)
+        return reply_twiml(msg)
+
+    # seleção numérica: "escolher 2" ou "livro 2"
+    m_sel_num = re.match(r"^(?:escolher|livro)\s+(\d+)$", low)
+    if m_sel_num:
+        num = int(m_sel_num.group(1))
+        msg = _reading_select_book(user, str(num))
+        db["users"][user_id] = user; save_db(db)
+        return reply_twiml(msg)
+
+    # atalho: se a lista foi mostrada e o usuário manda só "2"
+    m_only_num = re.match(r"^(\d{1,3})$", low)
+    if m_only_num and (st_read.get("menu") or not st_read.get("selected_book")):
+        num = int(m_only_num.group(1))
+        msg = _reading_select_book(user, str(num))
+        db["users"][user_id] = user; save_db(db)
+        return reply_twiml(msg)
+
+    # compat: escolher por nome (ainda aceito, mas preferimos número)
+    m_sel_name = re.match(r"^escolher\s+livro\s+(.+)$", low)
+    if m_sel_name:
+        name = m_sel_name.group(1).strip()
         msg = _reading_select_book(user, name)
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg)
@@ -1222,7 +1260,6 @@ def bot_webhook():
         return reply_twiml(msg)
 
     # -------- Áudio (LEITURA) --------
-    # Se há mídia e estamos aguardando áudio da leitura, processa.
     try:
         if int(payload.get("NumMedia", "0") or "0") > 0:
             msg = _handle_audio_submission(user, payload)
