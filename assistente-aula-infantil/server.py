@@ -47,16 +47,48 @@ MAX_MATH_DAY      = 60
 MAX_PT_DAY        = 60
 ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))      # 5 por disciplina
 
-# Livros (PDFs)
+# Livros (PDFs) — ajustado para funcionar local (Windows/macOS) e no Railway
 def _default_books_dir():
+    # Se existir /data, usamos /data/books (persistente no Railway)
     if os.path.isdir("/data"):
         p = "/data/books"
         os.makedirs(p, exist_ok=True)
         return p
-    p = os.path.join(os.getcwd(), "books")
+    # Fallback local: pasta "books" ao lado do server.py
+    here = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(here, "books")
     os.makedirs(p, exist_ok=True)
     return p
+
 BOOKS_DIR = os.getenv("BOOKS_DIR", _default_books_dir())
+
+def _ensure_books_dir():
+    """
+    Copia PDFs da pasta 'books' ao lado do server.py para o destino efetivo (BOOKS_DIR).
+    - Em produção: copia do repo -> /data/books
+    - Em dev local (sem /data): BOOKS_DIR já é '.../assistente-aula-infantil/books', então não copia.
+    """
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(here, "books")
+        dst = BOOKS_DIR
+        os.makedirs(dst, exist_ok=True)
+        # Se src e dst são a MESMA pasta, não há o que copiar
+        if os.path.abspath(src) == os.path.abspath(dst):
+            return
+        if os.path.isdir(src):
+            for name in os.listdir(src):
+                if name.lower().endswith(".pdf"):
+                    s = os.path.join(src, name)
+                    d = os.path.join(dst, name)
+                    if not os.path.exists(d):
+                        shutil.copyfile(s, d)
+    except Exception:
+        # Evita travar startup por conta de cópia
+        pass
+
+# Garante que /data/books (se existir) receba os PDFs do repo
+_ensure_books_dir()
 
 # ------------------- Mensagens motivacionais -------------------
 MOTIV_QUOTES = [
@@ -533,6 +565,8 @@ def _reading_start_for_user(user) -> str:
     st = _reading_state(user)
     book = st.get("selected_book")
     if not book:
+        # garante que (em produção) os PDFs do repo foram copiados para /data/books
+        _ensure_books_dir()
         files = _list_books()
         if not files:
             return ("📚 Nenhum livro encontrado.\n"
@@ -549,21 +583,33 @@ def _reading_start_for_user(user) -> str:
     return _format_reading_prompt(pages, book)
 
 def _reading_select_book(user, name: str) -> str:
-    path = _book_path(name)
+    # aceita nome exato, case-insensitive ou parte do nome (se único)
+    def _resolve_name(nm: str) -> Optional[str]:
+        files = _list_books()
+        if not files: return None
+        nm_l = nm.lower().strip()
+        for f in files:
+            if f.lower() == nm_l:
+                return f
+        cand = [f for f in files if nm_l in f.lower()]
+        return cand[0] if len(cand) == 1 else None
+
+    resolved = _resolve_name(name) or name
+    path = _book_path(resolved)
     if not path:
         return "Livro não encontrado. Use *livros* para listar e *escolher livro <nome.pdf>*."
     tot = _pdf_total_pages(path)
     start = _suggest_start_page(path)
     st = _reading_state(user)
     st.update({
-        "selected_book": name,
+        "selected_book": os.path.basename(resolved),
         "total_pages": tot,
         "start_page": start,
         "cursor": start,
         "last_pages": None,
         "awaiting_audio": False,
     })
-    return (f"📚 Livro selecionado: *{name}* ({tot} páginas).\n"
+    return (f"📚 Livro selecionado: *{os.path.basename(resolved)}* ({tot} páginas).\n"
             f"Sugestão de início: *página {start}* (auto-detecção).\n"
             f"Se quiser alterar: *inicio <n>*.\n"
             f"Quando quiser começar: *iniciar leitura*.")
@@ -1074,7 +1120,7 @@ def bot_webhook():
             f"Fluxo do dia: *5 Matemática* → *5 Português* → *Leitura* (3 páginas) → fim do dia.\n\n"
             "MAT: 1) Adição  2) Subtração  3) Multiplicação  4) Divisão  5) Mista.\n"
             "PT : 1) Som inicial  2) Sílabas  3) Decodificação  4) Ortografia  5) Leitura.\n"
-            "LEITURA: escolha 1 PDF (/data/books), 3 páginas sequenciais por sessão, áudio ≥ 60s, nota > 8.\n\n"
+            f"LEITURA: escolha 1 PDF ({BOOKS_DIR}), 3 páginas sequenciais por sessão, áudio ≥ {MIN_AUDIO_SEC}s, nota > 8.\n\n"
             "Responda em *CSV* (vírgulas) nos módulos de MAT/PT ou envie *ok* para pular.\n"
             "Comandos: *iniciar*, *iniciar pt*, *iniciar leitura*, *livros*, *escolher livro <nome.pdf>*, *inicio <n>*, "
             "*resposta ...*, *ok*, *status*, *debug*, *reiniciar*, *reiniciar pt*, *#resetar*."
@@ -1083,6 +1129,8 @@ def bot_webhook():
 
     # LEITURA — utilitários/controle
     if low == "livros":
+        # garante sincronização (repo -> /data/books) em produção
+        _ensure_books_dir()
         files = _list_books()
         if not files:
             return reply_twiml(f"📚 Nenhum PDF encontrado em *{BOOKS_DIR}*. Suba os livros e tente de novo.")
