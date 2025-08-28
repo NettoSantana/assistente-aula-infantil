@@ -2,3 +2,6 @@ Flask==3.1.2
 twilio==9.7.1
 waitress==3.0.2
 python-dotenv==1.1.1
+pypdf
+mutagen
+requests

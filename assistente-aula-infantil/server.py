@@ -1,10 +1,10 @@
 # server.py — Assistente de Aula Infantil (ONLINE-ONLY)
 # Regra: não envia NENHUMA mensagem para a criança.
 #        Somente envia SMS aos responsáveis quando o dia termina com sucesso.
-# Fluxo diário: Matemática (5 rodadas) -> Português (5 rodadas) -> fecha o dia e notifica responsáveis.
+# Fluxo diário: Matemática (5) -> Português (5) -> Leitura (3 páginas) -> fecha o dia e notifica responsáveis.
 
-import os, re, random
-from typing import Optional, Dict, Any
+import os, re, random, tempfile, shutil
+from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
 from progress import init_user_if_needed
@@ -19,6 +19,15 @@ except Exception:
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 
+# NOVO: libs para PDF e áudio
+import requests
+from mutagen import File as MutagenFile
+try:
+    from pypdf import PdfReader
+except Exception:
+    # fallback se pacote instalado com nome antigo
+    from PyPDF2 import PdfReader  # type: ignore
+
 app = Flask(__name__)
 
 PROJECT_NAME = os.getenv("PROJECT_NAME", "assistente_aula_infantil")
@@ -31,11 +40,23 @@ _twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKE
 
 # ------------------- Flags / Config -------------------
 FEATURE_PORTUGUES = True
-FEATURE_LEITURA   = False
-AUTO_SEQUENCE_PT_AFTER_MATH = True                   # após Matemática inicia Português
+FEATURE_LEITURA   = True  # ATIVADO
+AUTO_SEQUENCE_PT_AFTER_MATH   = True                   # após Matemática inicia Português
+AUTO_SEQUENCE_READ_AFTER_PT   = True                   # após Português inicia Leitura
 MAX_MATH_DAY      = 60
 MAX_PT_DAY        = 60
-ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))    # 5 por disciplina
+ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))      # 5 por disciplina
+
+# Livros (PDFs)
+def _default_books_dir():
+    if os.path.isdir("/data"):
+        p = "/data/books"
+        os.makedirs(p, exist_ok=True)
+        return p
+    p = os.path.join(os.getcwd(), "books")
+    os.makedirs(p, exist_ok=True)
+    return p
+BOOKS_DIR = os.getenv("BOOKS_DIR", _default_books_dir())
 
 # ------------------- Mensagens motivacionais -------------------
 MOTIV_QUOTES = [
@@ -158,7 +179,6 @@ def describe_schedule(sched: dict) -> str:
     return " | ".join(parts)
 
 def _user_tz(user):
-    """Sem type hint para evitar reclamação do Pylance quando ZoneInfo=None."""
     tzname = user.get("profile", {}).get("tz") or "America/Bahia"
     if ZoneInfo:
         try:
@@ -411,11 +431,13 @@ def _mini_report_text(user, day_num: int) -> str:
     today = _today_key(user)
     mat = _count_rounds_for_day(user, "matematica", day_num)
     pt  = _count_rounds_for_day(user, "portugues",  day_num)
+    read_ok = "sim" if any(h.get("tipo")=="leitura" and h.get("day")==day_num for h in user.get("history",{}).get("leitura",[])) else "não"
     quote = pick_quote()
     return (f"✅ Relatório do dia ({today})\n"
             f"{nome} *concluiu as atividades* de hoje.\n"
             f"• Matemática: {mat}/5 rodadas\n"
             f"• Português: {pt}/5 rodadas\n"
+            f"• Leitura: {read_ok}\n"
             f"{quote}")
 
 def _close_day_and_notify(user, current_day: int):
@@ -428,6 +450,235 @@ def _close_day_and_notify(user, current_day: int):
         for g in _guardians_list(user):
             _send_sms(g, report)
         flags["report_sent"] = True
+
+# ============================================================
+# ===================== LEITURA (NOVO) =======================
+# ============================================================
+READ_KEYWORDS = {"SUMÁRIO","INDICE","ÍNDICE","PREFÁCIO","APRESENTAÇÃO","DEDICATÓRIA","AGRADECIMENTOS","CAPA","CONTENTS"}
+MIN_TEXT_CHARS = 120  # densidade mínima para considerar "conteúdo"
+MIN_AUDIO_SEC  = 60
+PASS_MIN_SCORE = 8.0001  # precisa ser > 8
+
+def _reading_state(user) -> Dict[str, Any]:
+    return user.setdefault("reading", {
+        "selected_book": None,
+        "total_pages": 0,
+        "start_page": None,
+        "cursor": None,
+        "last_pages": None,
+        "awaiting_audio": False,
+    })
+
+def _list_books() -> List[str]:
+    try:
+        files = [f for f in os.listdir(BOOKS_DIR) if f.lower().endswith(".pdf")]
+        files.sort()
+        return files
+    except Exception:
+        return []
+
+def _book_path(name: str) -> Optional[str]:
+    if not name: return None
+    path = os.path.abspath(os.path.join(BOOKS_DIR, name))
+    if not path.startswith(os.path.abspath(BOOKS_DIR)):  # sandbox
+        return None
+    return path if os.path.isfile(path) else None
+
+def _pdf_total_pages(path: str) -> int:
+    with open(path, "rb") as f:
+        reader = PdfReader(f)
+        return len(reader.pages)
+
+def _extract_text_len(reader: PdfReader, page_index: int) -> int:
+    try:
+        t = reader.pages[page_index].extract_text() or ""
+        t = t.strip()
+        # evita páginas com só números/índice
+        if any(k in t.upper() for k in READ_KEYWORDS): return 0
+        return len(re.sub(r"\s+", " ", t))
+    except Exception:
+        return 0
+
+def _suggest_start_page(path: str) -> int:
+    with open(path, "rb") as f:
+        reader = PdfReader(f)
+        n = len(reader.pages)
+        max_probe = min(15, n)
+        best = 1
+        for i in range(0, max_probe):
+            L = _extract_text_len(reader, i)
+            if L >= MIN_TEXT_CHARS:
+                best = i + 1  # páginas são 1-based para o usuário
+                break
+        return best
+
+def _pick_next_pages(user) -> Optional[Tuple[int,int,int]]:
+    st = _reading_state(user)
+    cur = int(st.get("cursor") or 1)
+    tot = int(st.get("total_pages") or 0)
+    if cur > tot: return None
+    p1 = cur
+    p2 = min(cur+1, tot)
+    p3 = min(cur+2, tot)
+    return (p1, p2, p3)
+
+def _format_reading_prompt(pages: Tuple[int,int,int], book: str) -> str:
+    p1,p2,p3 = pages
+    return (f"📖 *Leitura* — Livro: *{book}*\n"
+            f"Páginas da vez: *{p1}, {p2}, {p3}*.\n"
+            f"Grave *1 áudio* com *≥ {MIN_AUDIO_SEC}s* resumindo o que leu nessas páginas.\n"
+            f"Critério: nota > {int(PASS_MIN_SCORE)} para passar. Envie apenas o áudio.")
+
+def _reading_start_for_user(user) -> str:
+    st = _reading_state(user)
+    book = st.get("selected_book")
+    if not book:
+        files = _list_books()
+        if not files:
+            return ("📚 Nenhum livro encontrado.\n"
+                    f"Envie PDFs para *{BOOKS_DIR}* e depois use *livros* / *escolher livro <nome.pdf>*.")
+        li = "\n".join(f"- {x}" for x in files[:12])
+        return ("📚 Escolha um livro primeiro:\n" + li +
+                "\n\nUse: *escolher livro <nome.pdf>*\n"
+                "Se precisar ajustar a página inicial útil: *inicio <n>*")
+    pages = _pick_next_pages(user)
+    if not pages:
+        return "Este livro parece concluído. Escolha outro com *escolher livro <nome.pdf>*."
+    st["awaiting_audio"] = True
+    st["last_pages"] = list(pages)
+    return _format_reading_prompt(pages, book)
+
+def _reading_select_book(user, name: str) -> str:
+    path = _book_path(name)
+    if not path:
+        return "Livro não encontrado. Use *livros* para listar e *escolher livro <nome.pdf>*."
+    tot = _pdf_total_pages(path)
+    start = _suggest_start_page(path)
+    st = _reading_state(user)
+    st.update({
+        "selected_book": name,
+        "total_pages": tot,
+        "start_page": start,
+        "cursor": start,
+        "last_pages": None,
+        "awaiting_audio": False,
+    })
+    return (f"📚 Livro selecionado: *{name}* ({tot} páginas).\n"
+            f"Sugestão de início: *página {start}* (auto-detecção).\n"
+            f"Se quiser alterar: *inicio <n>*.\n"
+            f"Quando quiser começar: *iniciar leitura*.")
+
+def _reading_set_start(user, n: int) -> str:
+    st = _reading_state(user)
+    if not st.get("selected_book"):
+        return "Escolha um livro antes. Use *livros* / *escolher livro <nome.pdf>*."
+    n = max(1, int(n))
+    n = min(n, int(st.get("total_pages") or n))
+    st["start_page"] = n
+    st["cursor"] = n
+    st["last_pages"] = None
+    st["awaiting_audio"] = False
+    return f"✅ Início ajustado para a *página {n}*. Envie *iniciar leitura*."
+
+def _reading_register_result(user, pages: Tuple[int,int,int], seconds: float, score: float, day_num: int):
+    hist = user.setdefault("history", {})
+    hist.setdefault("leitura", [])
+    hist["leitura"].append({
+        "tipo":"leitura",
+        "pages": list(pages),
+        "seconds": round(seconds,1),
+        "score": round(score,2),
+        "book": _reading_state(user).get("selected_book"),
+        "day": day_num,
+    })
+    # simples incremento de nível
+    user.setdefault("levels", {}).setdefault("leitura", 0)
+    user["levels"]["leitura"] += 1
+
+def _score_from_seconds(sec: float) -> float:
+    # Base simples por duração: 60s = 6, +1 ponto a cada 6s extra, teto 10
+    base = 6.0 + max(0.0, (sec - MIN_AUDIO_SEC)) / 6.0
+    return min(10.0, base)
+
+def _handle_audio_submission(user, payload) -> Optional[str]:
+    """Processa áudio quando estamos aguardando (via Twilio WhatsApp)."""
+    st = _reading_state(user)
+    if not st.get("awaiting_audio"):
+        return None
+    num_media = int(payload.get("NumMedia", "0") or "0")
+    if num_media < 1:
+        return "Envie o *áudio* (nota por duração)."
+    # Pega o primeiro áudio
+    media_url = None
+    ctype = None
+    for i in range(num_media):
+        ct = payload.get(f"MediaContentType{i}")
+        if ct and ct.startswith("audio"):
+            media_url = payload.get(f"MediaUrl{i}")
+            ctype = ct
+            break
+    if not media_url:
+        return "Anexo recebido, mas não é áudio. Envie um *áudio* de resumo (≥ 60s)."
+
+    # Baixa o arquivo com auth da Twilio
+    try:
+        resp = requests.get(media_url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=20)
+        resp.raise_for_status()
+    except Exception:
+        return "Não consegui baixar o áudio. Tente reenviar."
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        ext = ".bin"
+        if ctype and "/" in ctype:
+            ext = "." + ctype.split("/")[1].split(";")[0]
+        fpath = os.path.join(tmpdir, f"audio{ext}")
+        with open(fpath, "wb") as f:
+            f.write(resp.content)
+
+        au = MutagenFile(fpath)
+        if not au or not getattr(au, "info", None) or not getattr(au.info, "length", None):
+            return "Não consegui ler a duração do áudio. Regrave em *ogg/mp3/m4a*."
+        sec = float(au.info.length)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    pages = tuple(st.get("last_pages") or _pick_next_pages(user) or [])
+    if not pages:
+        st["awaiting_audio"] = False
+        return "Não encontrei páginas pendentes. Envie *iniciar leitura*."
+
+    score = _score_from_seconds(sec)
+    p1,p2,p3 = pages
+    sec_i = int(round(sec))
+
+    if sec < MIN_AUDIO_SEC or score <= PASS_MIN_SCORE:
+        need = f"❌ Áudio com *{sec_i}s* → nota *{score:.1f}/10*.\n"
+        need += f"Critério: *≥ {MIN_AUDIO_SEC}s* e *nota > 8*.\n"
+        need += f"Regrave o resumo das páginas *{p1}–{p3}*."
+        return need
+
+    # Aprovado
+    day = int(user.get("curriculum_pt",{}).get("pt_day", user.get("curriculum",{}).get("math_day",1)))
+    _reading_register_result(user, pages, sec, score, day)
+    # avança cursor
+    st["cursor"] = min(int(st["cursor"] or 1) + 3, int(st["total_pages"] or 1))
+    st["awaiting_audio"] = False
+    st["last_pages"] = None
+
+    # Fecha o dia: sincroniza próximos dias de MAT/PT e notifica responsáveis
+    cur_pt  = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
+    cur_mat = user.setdefault("curriculum",   {"math_day": 1, "total_days": MAX_MATH_DAY})
+    current_day = int(day)
+    next_day = current_day + 1
+    cur_pt["pt_day"]    = min(MAX_PT_DAY,  next_day)
+    cur_mat["math_day"] = min(MAX_MATH_DAY, next_day)
+    _close_day_and_notify(user, current_day)
+
+    return (f"✅ *Leitura concluída!* Páginas *{p1}–{p3}*.\n"
+            f"Áudio: *{sec_i}s* → Nota *{score:.1f}/10*.\n"
+            f"📅 *Dia {current_day} fechado.* Amanhã seguimos com a Matemática do dia {next_day}.\n"
+            f"Se quiser continuar o mesmo livro depois, é só enviar *iniciar leitura*.")
 
 # ------------------- Correção / avanço (Matemática) -------------------
 def _check_math_batch(user, text: str):
@@ -472,7 +723,7 @@ def _check_math_batch(user, text: str):
     # Finalizou as 5 de MAT
     user["levels"]["matematica"] = user["levels"].get("matematica", 0) + 1
 
-    if FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH and not FEATURE_LEITURA:
+    if FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH:
         # sincroniza PT com o dia atual e abre PT rodada 1
         user["pending"].pop("pt_lote", None)
         cur_pt = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
@@ -480,16 +731,13 @@ def _check_math_batch(user, text: str):
         batch2 = _start_pt_batch_for_day(user, day, 1)
         return True, f"🎉 *Matemática do dia {day} concluída!* Agora vamos para *Português* (5 rodadas).\n\n" + _format_pt_prompt(batch2)
 
-    # Se PT não ativo, o dia termina aqui → notifica responsáveis
+    # (fallback) Se PT não ativo, fecha dia
     _close_day_and_notify(user, day)
-
     cur = user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
     next_day = min(MAX_MATH_DAY, int(cur.get("math_day",1)) + 1)
     cur["math_day"] = next_day
-
     if day == MAX_MATH_DAY and round_idx == rounds_total:
         return True, "🎉 *Parabéns!* Você concluiu o plano até o *dia 60*. Para recomeçar, envie *reiniciar*."
-
     batch2 = _start_math_batch_for_day(user, next_day, 1)
     return True, f"🎉 *Dia {day} concluído!* {first_name_from_profile(user).title()} foi muito bem.\n\n" + _format_math_prompt(batch2)
 
@@ -533,19 +781,24 @@ def _check_pt_batch(user, text: str):
         batch2 = _start_pt_batch_for_day(user, day, next_round)
         return True, f"✅ Rodada {round_idx}/{rounds_total} (PT) concluída! Vamos para a *Rodada {next_round}/{rounds_total}*.\n\n" + _format_pt_prompt(batch2)
 
-    # Última rodada de PT → fecha o dia e notifica responsáveis
+    # Última rodada de PT → se LEITURA ativa, inicia leitura; senão fecha o dia
     user["levels"]["portugues"] = user["levels"].get("portugues", 0) + 1
 
+    if FEATURE_LEITURA and AUTO_SEQUENCE_READ_AFTER_PT:
+        # garante estruturas de histórico/nível de leitura
+        user.setdefault("history", {}).setdefault("leitura", [])
+        user.setdefault("levels", {}).setdefault("leitura", 0)
+        msg = _reading_start_for_user(user)
+        return True, f"🎉 *Português do dia {day} concluído!* Agora vamos para *Leitura*.\n\n{msg}"
+
+    # Sem leitura → fechar dia
     cur_pt  = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
     cur_mat = user.setdefault("curriculum",   {"math_day": 1, "total_days": MAX_MATH_DAY})
-
     current_day = int(pend.get("day", day))
     next_day = current_day + 1
     cur_pt["pt_day"]    = min(MAX_PT_DAY,  next_day)
     cur_mat["math_day"] = min(MAX_MATH_DAY, next_day)
-
     _close_day_and_notify(user, current_day)
-
     if current_day == MAX_PT_DAY:
         return True, "🎉 *Parabéns!* Você concluiu o plano de Português. Para recomeçar, envie *reiniciar pt*."
     return True, f"🎉 *Dia {current_day} concluído!* Amanhã seguimos com *Matemática do dia {next_day}*. Envie *iniciar* quando quiser começar."
@@ -574,7 +827,7 @@ def ob_state(user):
 def ob_start() -> str:
     return (
         "Oi! Eu sou a *MARIA ANGELA* 🌟 sua assistente de aula.\n"
-        "Vou te acompanhar em atividades de *Matemática* e *Português*.\n\n"
+        "Vou te acompanhar em atividades de *Matemática*, *Português* e *Leitura*.\n\n"
         "Pra começar, me diga: *qual é o nome da criança?*"
     )
 
@@ -732,7 +985,7 @@ def ob_step(user, text: str) -> str:
             user["onboarding"] = {"step": None, "data": {}}
             user.setdefault("daily_flags", {})
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
-                    "Envie *iniciar* (Matemática). Após Matemática, *Português* abre automaticamente.")
+                    "Envie *iniciar* (Matemática). Depois vem *Português* e *Leitura* automaticamente.")
         elif t in {"não","nao"}:
             return ("Sem problema! Você pode corrigir assim:\n"
                     "• *nome:* Ana Souza\n• *idade:* 7\n• *serie:* 2º ano\n"
@@ -774,10 +1027,12 @@ def bot_webhook():
     levels = user.setdefault("levels", {})
     levels.setdefault("matematica", 0)
     levels.setdefault("portugues", 0)
+    levels.setdefault("leitura", 0)
 
     history = user.setdefault("history", {})
     history.setdefault("matematica", [])
     history.setdefault("portugues", [])
+    history.setdefault("leitura", [])
 
     user.setdefault("daily_flags", {})  # só usamos report_sent/completed
 
@@ -789,9 +1044,14 @@ def bot_webhook():
             "pending": {},
             "curriculum": {"math_day": 1, "total_days": MAX_MATH_DAY},
             "curriculum_pt": {"pt_day": 1, "total_days": MAX_PT_DAY},
-            "levels": {"matematica": 0, "portugues": 0},
-            "history": {"matematica": [], "portugues": []},
-            "daily_flags": {}
+            "levels": {"matematica": 0, "portugues": 0, "leitura": 0},
+            "history": {"matematica": [], "portugues": [], "leitura": []},
+            "daily_flags": {},
+            "reading": {
+                "selected_book": None, "total_pages": 0,
+                "start_page": None, "cursor": None,
+                "last_pages": None, "awaiting_audio": False
+            }
         }
         db["users"][user_id] = fresh
         save_db(db)
@@ -811,77 +1071,50 @@ def bot_webhook():
     # -------- Comandos --------
     if low in {"menu","ajuda","help"}:
         reply = (
-            f"Fluxo do dia: *5 rodadas de Matemática* → (auto) *5 rodadas de Português* → fim do dia.\n"
-            "(Módulo *Leitura* está desativado.)\n\n"
+            f"Fluxo do dia: *5 Matemática* → *5 Português* → *Leitura* (3 páginas) → fim do dia.\n\n"
             "MAT: 1) Adição  2) Subtração  3) Multiplicação  4) Divisão  5) Mista.\n"
             "PT : 1) Som inicial  2) Sílabas  3) Decodificação  4) Ortografia  5) Leitura.\n"
-            "Responda em *CSV* (vírgulas) ou envie *ok* para pular.\n"
-            "Comandos: *iniciar*, *iniciar pt*, *resposta ...*, *ok*, *status*, *debug*, *reiniciar*, *reiniciar pt*, *#resetar*."
+            "LEITURA: escolha 1 PDF (/data/books), 3 páginas sequenciais por sessão, áudio ≥ 60s, nota > 8.\n\n"
+            "Responda em *CSV* (vírgulas) nos módulos de MAT/PT ou envie *ok* para pular.\n"
+            "Comandos: *iniciar*, *iniciar pt*, *iniciar leitura*, *livros*, *escolher livro <nome.pdf>*, *inicio <n>*, "
+            "*resposta ...*, *ok*, *status*, *debug*, *reiniciar*, *reiniciar pt*, *#resetar*."
         )
         return reply_twiml(reply)
 
-    if low == "status":
-        cur_day = int(user.get("curriculum",{}).get("math_day",1))
-        cur_pt  = int(user.get("curriculum_pt",{}).get("pt_day",1))
-        pend    = user.get("pending", {}).get("mat_lote")
-        pend_pt = user.get("pending", {}).get("pt_lote")
-        round_mat = f"{pend.get('round',1)}/{pend.get('rounds_total',ROUNDS_PER_DAY)}" if pend else "—"
-        round_pt  = f"{pend_pt.get('round',1)}/{pend_pt.get('rounds_total',ROUNDS_PER_DAY)}" if pend_pt else "—"
-        etapa = "Português" if pend_pt else ("Matemática" if pend else "—")
-        dk = _today_key(user)
-        flags = user.get("daily_flags", {}).get(dk, {})
-        reply = (f"📊 *Status*\n"
-                 f"• Matemática: dia {cur_day}/{MAX_MATH_DAY} | rodada {round_mat} | nível {user['levels']['matematica']} | feitos {len(user['history']['matematica'])}\n"
-                 f"• Português:  dia {cur_pt}/{MAX_PT_DAY} | rodada {round_pt} | nível {user['levels']['portugues']} | feitos {len(user['history']['portugues'])}\n"
-                 f"• Etapa do dia agora: {etapa}\n"
-                 f"• Hoje — relatório enviado: {'sim' if flags.get('report_sent') else 'não'} | concluído: {'sim' if flags.get('completed') else 'não'}")
-        return reply_twiml(reply)
+    # LEITURA — utilitários/controle
+    if low == "livros":
+        files = _list_books()
+        if not files:
+            return reply_twiml(f"📚 Nenhum PDF encontrado em *{BOOKS_DIR}*. Suba os livros e tente de novo.")
+        li = "\n".join(f"- {x}" for x in files[:30])
+        tail = "" if len(files) <= 30 else f"\n… ({len(files)-30} mais)"
+        return reply_twiml("📚 *Livros disponíveis:*\n" + li + tail + "\n\nUse: *escolher livro <nome.pdf>*")
 
-    if low == "debug":
-        cur_day = int(user.get("curriculum", {}).get("math_day", 1))
-        cur_pt  = int(user.get("curriculum_pt", {}).get("pt_day", 1))
-        pend    = user.get("pending", {}).get("mat_lote")
-        pend_pt = user.get("pending", {}).get("pt_lote")
-        pend_flag   = "sim" if pend else "não"
-        pend_ptflag = "sim" if pend_pt else "não"
-        spec = (pend or {}).get("spec", {}) or {}
-        spec_pt = (pend_pt or {}).get("spec", {}) or {}
-        title = (pend or {}).get("title", "-")
-        title_pt = (pend_pt or {}).get("title", "-")
-        round_str = f"{(pend or {}).get('round','-')}/{(pend or {}).get('rounds_total','-')}" if pend else "-"
-        round_str_pt = f"{(pend_pt or {}).get('round','-')}/{(pend_pt or {}).get('rounds_total','-')}" if pend_pt else "-"
-        dk = _today_key(user); flags = user.get("daily_flags", {}).get(dk, {})
-        reply = (
-            "🛠 *DEBUG*\n"
-            f"• MAT day: {cur_day}/{MAX_MATH_DAY} | pendência: {pend_flag} | round: {round_str}\n"
-            f"  title: {title}\n"
-            f"  spec: {spec}\n"
-            f"• PT  day: {cur_pt}/{MAX_PT_DAY} | pendência: {pend_ptflag} | round: {round_str_pt}\n"
-            f"  title: {title_pt}\n"
-            f"  spec: {spec_pt}\n"
-            f"• Flags hoje: {flags}\n"
-            f"• Auto PT após MAT: {'sim' if (FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH and not FEATURE_LEITURA) else 'não'}"
-        )
-        return reply_twiml(reply)
-
-    if low in {"reiniciar","zerar","resetar"}:
-        user["curriculum"] = {"math_day": 1, "total_days": MAX_MATH_DAY}
-        user["pending"].pop("mat_lote", None)
+    m_sel = re.match(r"^escolher\s+livro\s+(.+)$", low)
+    if m_sel:
+        name = m_sel.group(1).strip()
+        msg = _reading_select_book(user, name)
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml("🔁 Matemática reiniciada. Envie *iniciar* para começar do *Dia 1* (Rodada 1).")
+        return reply_twiml(msg)
 
-    if low in {"reiniciar pt","resetar pt","zerar pt"}:
-        user["curriculum_pt"] = {"pt_day": 1, "total_days": MAX_PT_DAY}
-        user["pending"].pop("pt_lote", None)
+    m_ini = re.match(r"^inicio\s+(\d+)$", low)
+    if m_ini:
+        n = int(m_ini.group(1))
+        msg = _reading_set_start(user, n)
         db["users"][user_id] = user; save_db(db)
-        return reply_twiml("🔁 Português reiniciado. Envie *iniciar pt* para começar do *Dia 1* (Rodada 1).")
+        return reply_twiml(msg)
 
-    # -------- Iniciar sessões --------
+    if low in {"iniciar leitura","leitura iniciar"}:
+        msg = _reading_start_for_user(user)
+        db["users"][user_id] = user; save_db(db)
+        return reply_twiml(msg)
+
+    # -------- Iniciar sessões MAT/PT --------
     if low == "iniciar":
         if "pt_lote" in user.get("pending", {}):
             batch = user["pending"]["pt_lote"]
             db["users"][user_id] = user; save_db(db)
-            return reply_twiml("Estamos em *Português* agora. Conclua as 5 rodadas de PT para fechar o dia.\n\n" + _format_pt_prompt(batch))
+            return reply_twiml("Estamos em *Português* agora. Conclua as 5 rodadas de PT.\n\n" + _format_pt_prompt(batch))
         if "mat_lote" in user.get("pending", {}):
             batch = user["pending"]["mat_lote"]
             db["users"][user_id] = user; save_db(db)
@@ -915,11 +1148,7 @@ def bot_webhook():
         saudacao = f"Olá, {nome}! Vamos iniciar *Português* de hoje (5 rodadas). 👋"
         return reply_twiml(saudacao + "\n\n" + _format_pt_prompt(batch))
 
-    if low.startswith("leitura ok"):
-        db["users"][user_id] = user; save_db(db)
-        return reply_twiml("📖 *Leitura* está desativada no momento. Siga com *Matemática* ou *Português*.")
-
-    # -------- Respostas --------
+    # -------- Respostas MAT/PT --------
     if low in {"ok","ok!","ok."} and ("pt_lote" not in user.get("pending", {}) and "mat_lote" not in user.get("pending", {})):
         day = int(user.get("curriculum",{}).get("math_day",1))
         if day > MAX_MATH_DAY:
@@ -944,7 +1173,18 @@ def bot_webhook():
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg)
 
-    return reply_twiml("Envie *iniciar* (Matemática). Após terminar as 5 rodadas de MAT, *Português* abre automaticamente (mais 5), e o dia fecha com relatório aos responsáveis.")
+    # -------- Áudio (LEITURA) --------
+    # Se há mídia e estamos aguardando áudio da leitura, processa.
+    try:
+        if int(payload.get("NumMedia", "0") or "0") > 0:
+            msg = _handle_audio_submission(user, payload)
+            if msg:
+                db["users"][user_id] = user; save_db(db)
+                return reply_twiml(msg)
+    except Exception:
+        pass
+
+    return reply_twiml("Envie *iniciar* (Matemática). O fluxo é: MAT → PT → LEITURA (3 páginas).")
 
 if __name__ == "__main__":
     # Railway define PORT automaticamente
