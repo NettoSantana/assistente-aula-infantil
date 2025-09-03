@@ -1,32 +1,38 @@
 # server.py — Assistente de Aula Infantil (ONLINE-ONLY)
-# Regra: não envia NENHUMA mensagem para a criança.
-#        Somente envia SMS aos responsáveis quando o dia termina com sucesso.
-# Fluxo diário: Matemática (5) -> Português (5) -> Leitura (3 páginas) -> fecha o dia e notifica responsáveis.
+# Regras (atualizadas):
+# - Envia mensagens para a criança SOMENTE:
+#     • lembrete 5 min antes do horário
+#     • mensagem motivacional ao fim do dia
+# - Notificações aos responsáveis:
+#     • ao concluir cadastro
+#     • ao fechar o dia com sucesso (relatório + motivacional)
+#     • alerta de atraso 3h após o horário combinado, se não fez
+# - Fluxo do dia: Matemática (5) -> Português (5) -> Leitura (3 págs) -> fecha o dia.
 
-import os, re, random, tempfile, shutil
-import subprocess  # NEW: fallback com ffprobe
+import os, re, json, random, tempfile, shutil, subprocess
 from typing import Optional, Dict, Any, List, Tuple
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
 from progress import init_user_if_needed
 
-from datetime import datetime
+from datetime import datetime, timedelta
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
     ZoneInfo = None
 
+from urllib.parse import quote_plus
+
 # Twilio — TwiML (resposta imediata) + envios proativos
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 
-# NOVO: libs para PDF e áudio
+# PDF e áudio
 import requests
 from mutagen import File as MutagenFile
 try:
     from pypdf import PdfReader
 except Exception:
-    # fallback se pacote instalado com nome antigo
     from PyPDF2 import PdfReader  # type: ignore
 
 app = Flask(__name__)
@@ -36,26 +42,32 @@ PROJECT_NAME = os.getenv("PROJECT_NAME", "assistente_aula_infantil")
 # Twilio (Railway)
 TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_FROM  = os.getenv("TWILIO_FROM", "")
+TWILIO_FROM  = os.getenv("TWILIO_FROM", "")     # ex: "whatsapp:+14155238886" ou "+1..."
 _twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if (TWILIO_SID and TWILIO_TOKEN) else None
 
 # ------------------- Flags / Config -------------------
 FEATURE_PORTUGUES = True
-FEATURE_LEITURA   = True  # ATIVADO
-AUTO_SEQUENCE_PT_AFTER_MATH   = True                   # após Matemática inicia Português
-AUTO_SEQUENCE_READ_AFTER_PT   = True                   # após Português inicia Leitura
-MAX_MATH_DAY      = 60
-MAX_PT_DAY        = 60
-ROUNDS_PER_DAY    = int(os.getenv("ROUNDS", "5"))      # 5 por disciplina
+FEATURE_LEITURA   = True
+AUTO_SEQUENCE_PT_AFTER_MATH = True
+AUTO_SEQUENCE_READ_AFTER_PT = True
+MAX_MATH_DAY = 60
+MAX_PT_DAY   = 60
+ROUNDS_PER_DAY = int(os.getenv("ROUNDS", "5"))  # 5 por disciplina
 
-# Livros (PDFs) — ajustado para funcionar local (Windows/macOS) e no Railway
+# Agendador: usaremos cron externo batendo neste endpoint:
+#   GET /admin/cron/minutely
+# Regras:
+# - 5 min antes do horário: lembrete p/ criança
+# - 3h depois do horário, se não fez: alerta p/ responsáveis
+REMINDER_MINUTES_BEFORE = 5
+LATE_HOURS_AFTER = 3
+
+# ------------------- Livros (PDFs) -------------------
 def _default_books_dir():
-    # Se existir /data, usamos /data/books (persistente no Railway)
     if os.path.isdir("/data"):
         p = "/data/books"
         os.makedirs(p, exist_ok=True)
         return p
-    # Fallback local: pasta "books" ao lado do server.py
     here = os.path.dirname(os.path.abspath(__file__))
     p = os.path.join(here, "books")
     os.makedirs(p, exist_ok=True)
@@ -64,11 +76,6 @@ def _default_books_dir():
 BOOKS_DIR = os.getenv("BOOKS_DIR", _default_books_dir())
 
 def _ensure_books_dir():
-    """
-    Copia PDFs da pasta 'books' ao lado do server.py para o destino efetivo (BOOKS_DIR).
-    - Em produção: copia do repo -> /data/books
-    - Em dev local (sem /data): BOOKS_DIR já é '.../assistente-aula-infantil/books', então não copia.
-    """
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         src = os.path.join(here, "books")
@@ -86,39 +93,79 @@ def _ensure_books_dir():
     except Exception:
         pass
 
-# Garante que /data/books (se existir) receba os PDFs do repo
 _ensure_books_dir()
 
-# ------------------- Mensagens motivacionais -------------------
+# ------------------- Frases motivacionais -------------------
 MOTIV_QUOTES = [
     ("A disciplina é a ponte entre metas e conquistas.", "Jim Rohn"),
     ("O sucesso é a soma de pequenos esforços repetidos dia após dia.", "Robert Collier"),
     ("Persistência é o caminho do êxito.", "Charlie Chaplin"),
-    ("A prática não leva à perfeição; a prática consistente leva ao progresso.", None),
-    ("Você não precisa ser o melhor, só precisa ser melhor do que ontem.", None),
-    ("Disciplina é fazer o simples mesmo quando ninguém está vendo.", None),
+    ("A prática consistente leva ao progresso.", None),
+    ("Melhor do que ontem, e pronto.", None),
     ("Esforço hoje é confiança amanhã.", None),
-    ("Passinho a passinho, a montanha inteira se movimenta.", None),
+    ("Passinho a passinho, a montanha se move.", None),
     ("Quem treina todo dia constrói músculos de mente.", None),
 ]
 def pick_quote() -> str:
     text, author = random.choice(MOTIV_QUOTES)
     return f"“{text}”" + (f" — {author}" if author else "")
 
-# ------------------- Util: TwiML -------------------
+# ------------------- Backup/Export -------------------
+def _snapshot_db(db) -> Optional[str]:
+    try:
+        base = "/data/backups" if os.path.isdir("/data") else "./backups"
+        os.makedirs(base, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(base, f"db-{ts}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+        return path
+    except Exception:
+        return None
+
+# ------------------- Twilio helpers -------------------
+def _from_is_whatsapp() -> bool:
+    return TWILIO_FROM.strip().lower().startswith("whatsapp:")
+
+def _ensure_channel_prefix(to: str) -> str:
+    """Se o FROM é WhatsApp, garante 'whatsapp:' no TO."""
+    to = (to or "").strip()
+    if not to:
+        return to
+    if _from_is_whatsapp():
+        return to if to.lower().startswith("whatsapp:") else f"whatsapp:{to}"
+    return to.replace("whatsapp:", "")
+
+def _digits_only(num: str) -> str:
+    return re.sub(r"\D", "", num or "")
+
+def _wa_click_link(preset_text: str = "iniciar") -> Optional[str]:
+    """Gera link wa.me com texto presetado (fallback para 'iniciar' clicável)."""
+    try:
+        sender = TWILIO_FROM.replace("whatsapp:", "")
+        digits = _digits_only(sender)
+        if not digits:
+            return None
+        return f"https://wa.me/{digits}?text={quote_plus(preset_text)}"
+    except Exception:
+        return None
+
+def _send_message(to: Optional[str], body: str) -> bool:
+    """Envio genérico (WhatsApp/SMS dependendo do FROM)."""
+    if not to or not _twilio_client or not TWILIO_FROM:
+        return False
+    try:
+        dest = _ensure_channel_prefix(to)
+        _twilio_client.messages.create(to=dest, from_=TWILIO_FROM, body=body)
+        return True
+    except Exception:
+        return False
+
+# ------------------- TwiML reply -------------------
 def reply_twiml(text: str) -> Response:
     r = MessagingResponse()
     r.message(text)
     return Response(str(r), mimetype="application/xml", status=200)
-
-def _send_sms(to: Optional[str], body: str) -> bool:
-    if not to or not _twilio_client or not TWILIO_FROM:
-        return False
-    try:
-        _twilio_client.messages.create(to=to, from_=TWILIO_FROM, body=body)
-        return True
-    except Exception:
-        return False
 
 # ------------------- Telefones / formatação -------------------
 BR_DEFAULT_CC = "55"
@@ -155,18 +202,11 @@ def parse_grade(txt: str) -> Optional[str]:
     if t in {"1","2","3","4","5"}: return GRADE_MAP.get(t)
     return None
 
-def age_from_text(txt: str) -> Optional[int]:
-    m = re.search(r"(\d{1,2})", txt or "")
-    if not m: return None
-    val = int(m.group(1))
-    return val if 3 <= val <= 13 else None
-
-# ------------------- Saudação -------------------
+# ------------------- Saudação/Tempo -------------------
 def first_name_from_profile(user) -> str:
     name = (user.get("profile", {}).get("child_name") or "").strip()
     return name.split()[0] if name else "aluno"
 
-# ------------------- Tempo / Rotina -------------------
 DEFAULT_DAYS = ["mon","tue","wed","thu","fri","sat"]
 DAY_ORDER    = ["mon","tue","wed","thu","fri","sat","sun"]
 DAYS_PT      = {"mon":"seg","tue":"ter","wed":"qua","thu":"qui","fri":"sex","sat":"sáb","sun":"dom"}
@@ -212,10 +252,8 @@ def describe_schedule(sched: dict) -> str:
 def _user_tz(user):
     tzname = user.get("profile", {}).get("tz") or "America/Bahia"
     if ZoneInfo:
-        try:
-            return ZoneInfo(tzname)
-        except Exception:
-            pass
+        try: return ZoneInfo(tzname)
+        except Exception: pass
     return None
 
 def _now(user=None) -> datetime:
@@ -225,6 +263,22 @@ def _now(user=None) -> datetime:
 def _today_key(user) -> str:
     n = _now(user)
     return n.strftime("%Y-%m-%d")
+
+# ------------------- Streak (1x por dia) -------------------
+def _update_streak_on_complete(user):
+    tznow = _now(user)
+    today = tznow.strftime("%Y-%m-%d")
+    st = user.setdefault("streak", {"count": 0, "last_date": None})
+    last = st.get("last_date")
+    if last == today:
+        return  # já contou hoje
+    # dia anterior no fuso do usuário
+    yday = (tznow - timedelta(days=1)).strftime("%Y-%m-%d")
+    if last == yday:
+        st["count"] = int(st.get("count") or 0) + 1
+    else:
+        st["count"] = 1
+    st["last_date"] = today
 
 # ============================================================
 # =================== MATEMÁTICA (progressivo) ===============
@@ -242,9 +296,7 @@ def _format_math_prompt(batch):
     example = batch.get("prompt_example") or "Ex.: 2,4,6,8,10,12,14,16,18,20"
     lines = [
         f"🧩 *{title}* — Rodada {round_i}/{round_n}",
-        hint,
-        example,
-        ""
+        hint, example, ""
     ]
     for idx, p in enumerate(batch["problems"], start=1):
         lines.append(f"{idx}) {p} = ?")
@@ -258,7 +310,6 @@ def _parse_csv_numbers(s: str):
         except Exception: return None
     return nums
 
-# Geradores de exercícios (MAT)
 def _gen_add_direct(a: int):  return ([f"{a}+{i}" for i in range(1, 11)], [a + i for i in range(1, 11)])
 def _gen_add_inv(a: int):     return ([f"{i}+{a}" for i in range(1, 11)], [i + a for i in range(1, 11)])
 def _gen_add_mix10():
@@ -376,9 +427,7 @@ def _format_pt_prompt(batch):
     example = batch.get("prompt_example") or "Ex.: a,b,c,d,e,f,g,h,i,j"
     lines = [
         f"✍️ *{title}* — Rodada {round_i}/{round_n}",
-        hint,
-        example,
-        ""
+        hint, example, ""
     ]
     for idx, p in enumerate(batch["problems"], start=1):
         lines.append(f"{idx}) {p}")
@@ -449,7 +498,7 @@ def _start_pt_batch_for_day(user, day: int, round_idx: int = 1):
     user["pending"]["pt_lote"] = batch
     return batch
 
-# ---------- Aux: relatório e notificação (somente responsáveis) ----------
+# ------------------- Relatórios e notificações -------------------
 def _count_rounds_for_day(user, subject: str, day_num: int) -> int:
     hist = user.get("history", {}).get(subject, []) or []
     return sum(1 for h in hist if h.get("tipo") == "lote" and int(h.get("day", -1)) == int(day_num))
@@ -464,31 +513,64 @@ def _mini_report_text(user, day_num: int) -> str:
     pt  = _count_rounds_for_day(user, "portugues",  day_num)
     read_ok = "sim" if any(h.get("tipo")=="leitura" and h.get("day")==day_num for h in user.get("history",{}).get("leitura",[])) else "não"
     quote = pick_quote()
+    streak = user.get("streak", {}).get("count", 0)
     return (f"✅ Relatório do dia ({today})\n"
             f"{nome} *concluiu as atividades* de hoje.\n"
             f"• Matemática: {mat}/5 rodadas\n"
             f"• Português: {pt}/5 rodadas\n"
             f"• Leitura: {read_ok}\n"
-            f"{quote}")
+            f"• Streak: {streak} dia(s) seguidos\n"
+            f"{quote}\n"
+            f"Obrigado por reforçar a rotina! 💙")
+
+def _notify_guardians_onboarding(user):
+    prof = user.get("profile", {})
+    nome = (prof.get("child_name") or "a criança").title()
+    sched = prof.get("schedule") or {}
+    msg = (f"✅ Cadastro concluído para *{nome}*.\n"
+           f"Rotina: {describe_schedule(sched)}.\n"
+           "A partir de hoje: lembrete 5 min antes do horário, e relatório no fim do dia.\n"
+           "Qualquer dúvida, responda aqui. Vamos juntos! 💪")
+    for g in _guardians_list(user):
+        _send_message(g, msg)
+
+def _child_motivational_text(user) -> str:
+    nome = first_name_from_profile(user).title()
+    quote = pick_quote()
+    return (f"👏 Parabéns, {nome}! Você concluiu as atividades de hoje.\n"
+            f"Disciplina, persistência e esforço — é assim que se vence! 🌟\n{quote}")
 
 def _close_day_and_notify(user, current_day: int):
-    """Marca concluído e envia SMS só aos responsáveis (nunca à criança)."""
+    """Marca concluído, envia relatório aos responsáveis e motivacional à criança. Conta 1x por dia (streak)."""
     dk = _today_key(user)
     flags = user.setdefault("daily_flags", {}).setdefault(dk, {"report_sent": False, "completed": False})
+    already_completed = flags.get("completed", False)
+
     flags["completed"] = True
+    if not already_completed:
+        _update_streak_on_complete(user)
+
+    # relatório p/ responsáveis (uma vez por dia)
     if not flags.get("report_sent"):
         report = _mini_report_text(user, current_day)
         for g in _guardians_list(user):
-            _send_sms(g, report)
+            _send_message(g, report)
         flags["report_sent"] = True
+
+    # motivacional p/ criança (uma vez por dia)
+    if not flags.get("child_motiv_sent"):
+        child = user.get("profile", {}).get("child_phone")
+        if child:
+            _send_message(child, _child_motivational_text(user))
+        flags["child_motiv_sent"] = True
 
 # ============================================================
 # ===================== LEITURA (NOVO) =======================
 # ============================================================
 READ_KEYWORDS = {"SUMÁRIO","INDICE","ÍNDICE","PREFÁCIO","APRESENTAÇÃO","DEDICATÓRIA","AGRADECIMENTOS","CAPA","CONTENTS"}
-MIN_TEXT_CHARS = 120  # densidade mínima para considerar "conteúdo"
+MIN_TEXT_CHARS = 120
 MIN_AUDIO_SEC  = 60
-PASS_MIN_SCORE = 8.0001  # precisa ser > 8
+PASS_MIN_SCORE = 8.0001
 
 def _reading_state(user) -> Dict[str, Any]:
     return user.setdefault("reading", {
@@ -498,7 +580,7 @@ def _reading_state(user) -> Dict[str, Any]:
         "cursor": None,
         "last_pages": None,
         "awaiting_audio": False,
-        "menu": [],  # lista de arquivos mostrados por último para seleção numérica
+        "menu": [],
     })
 
 def _list_books() -> List[str]:
@@ -512,7 +594,7 @@ def _list_books() -> List[str]:
 def _book_path(name: str) -> Optional[str]:
     if not name: return None
     path = os.path.abspath(os.path.join(BOOKS_DIR, name))
-    if not path.startswith(os.path.abspath(BOOKS_DIR)):  # sandbox
+    if not path.startswith(os.path.abspath(BOOKS_DIR)):
         return None
     return path if os.path.isfile(path) else None
 
@@ -600,12 +682,10 @@ def _reading_select_book(user, name_or_pattern: str) -> str:
     if _reading_book_in_progress(st):
         return _lock_msg(st)
 
-    # aceita nome exato/substring (compat) OU índice numérico
     files = _list_books()
     if not files:
         return f"📚 Nenhum PDF encontrado em *{BOOKS_DIR}*."
 
-    # índice?
     mnum = re.fullmatch(r"\d{1,3}", name_or_pattern.strip())
     if mnum:
         idx = int(mnum.group(0))
@@ -624,8 +704,7 @@ def _reading_select_book(user, name_or_pattern: str) -> str:
             resolved = cand[0]
 
     path = _book_path(resolved)
-    if not path:
-        return "Livro não encontrado. Envie *livros* e escolha por número."
+    if not path: return "Livro não encontrado. Envie *livros* e escolha por número."
     tot = _pdf_total_pages(path)
     start = _suggest_start_page(path)
     st.update({
@@ -668,26 +747,17 @@ def _reading_register_result(user, pages: Tuple[int,int,int], seconds: float, sc
     user["levels"]["leitura"] += 1
 
 def _score_from_seconds(sec: float) -> float:
-    # 60s = 6; +1 pto a cada 6s extra; teto 10
+    # 60s = 6; +1 ponto a cada 6s extra; teto 10
     base = 6.0 + max(0.0, (sec - MIN_AUDIO_SEC)) / 6.0
     return min(10.0, base)
 
-# NEW: fallback com ffprobe
 def _probe_duration_ffprobe(fpath: str) -> Optional[float]:
-    """Tenta medir duração via ffprobe (se ffmpeg estiver instalado)."""
     try:
         if not shutil.which("ffprobe"):
             return None
         out = subprocess.check_output(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                fpath,
-            ],
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            universal_newlines=True,
+            ["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1", fpath],
+            stderr=subprocess.STDOUT, timeout=10, universal_newlines=True,
         ).strip()
         val = float(out)
         return val if val > 0 else None
@@ -695,7 +765,6 @@ def _probe_duration_ffprobe(fpath: str) -> Optional[float]:
         return None
 
 def _handle_audio_submission(user, payload) -> Optional[str]:
-    """Processa áudio quando estamos aguardando (via Twilio WhatsApp)."""
     st = _reading_state(user)
     if not st.get("awaiting_audio"):
         return None
@@ -704,18 +773,14 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
     if num_media < 1:
         return "Envie o *áudio* (nota por duração)."
 
-    # Aceita tipos 'audio/*' e alguns que chegam como video/ogg, webm ou application/ogg
     media_url = None
     ctype = None
     for i in range(num_media):
         ct = (payload.get(f"MediaContentType{i}") or "").lower()
         url = payload.get(f"MediaUrl{i}")
-        if not ct or not url:
-            continue
-        is_audioish = (
-            ct.startswith("audio")
-            or ct in {"video/ogg", "video/webm", "application/ogg", "application/octet-stream"}
-        )
+        if not ct or not url: continue
+        is_audioish = (ct.startswith("audio")
+                       or ct in {"video/ogg","video/webm","application/ogg","application/octet-stream"})
         if is_audioish:
             media_url = url
             ctype = ct
@@ -724,30 +789,18 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
     if not media_url:
         return "Anexo recebido, mas não é áudio. Envie um *áudio* de resumo (≥ 60s)."
 
-    # Baixa o arquivo com auth da Twilio
     try:
         resp = requests.get(media_url, auth=(TWILIO_SID, TWILIO_TOKEN), timeout=20)
         resp.raise_for_status()
     except Exception:
         return "Não consegui baixar o áudio. Tente reenviar."
 
-    # Mapeia extensões de forma mais ampla
     ext_map = {
-        "audio/mpeg": ".mp3",
-        "audio/mp3": ".mp3",
-        "audio/ogg": ".ogg",
-        "audio/ogg; codecs=opus": ".ogg",
-        "application/ogg": ".ogg",
-        "audio/opus": ".opus",
-        "audio/aac": ".m4a",
-        "audio/mp4": ".m4a",
-        "audio/m4a": ".m4a",
-        "audio/3gpp": ".3gp",
-        "audio/amr": ".amr",
-        "audio/webm": ".webm",
-        "video/ogg": ".ogg",
-        "video/webm": ".webm",
-        "application/octet-stream": ".bin",
+        "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+        "audio/ogg": ".ogg", "audio/ogg; codecs=opus": ".ogg", "application/ogg": ".ogg",
+        "audio/opus": ".opus", "audio/aac": ".m4a", "audio/mp4": ".m4a", "audio/m4a": ".m4a",
+        "audio/3gpp": ".3gp", "audio/amr": ".amr", "audio/webm": ".webm",
+        "video/ogg": ".ogg", "video/webm": ".webm", "application/octet-stream": ".bin",
     }
 
     tmpdir = tempfile.mkdtemp()
@@ -755,12 +808,10 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
         ext = ext_map.get(ctype or "", ".bin")
         if ext == ".bin" and (ctype or "").startswith("audio/") and "/" in (ctype or ""):
             ext = "." + ctype.split("/")[1].split(";")[0]
-
         fpath = os.path.join(tmpdir, f"audio{ext}")
         with open(fpath, "wb") as f:
             f.write(resp.content)
 
-        # 1ª tentativa: mutagen
         sec = None
         try:
             au = MutagenFile(fpath)
@@ -768,12 +819,9 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
                 sec = float(au.info.length)
         except Exception:
             sec = None
-
-        # 2ª tentativa: ffprobe (se disponível)
         if not sec:
             sec = _probe_duration_ffprobe(fpath)
 
-        # 3ª tentativa: algum campo de duração no webhook (se existir)
         if not sec:
             mdur = payload.get("MediaDuration0") or payload.get("MediaDuration")
             try:
@@ -809,12 +857,12 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
     day = int(user.get("curriculum_pt",{}).get("pt_day", user.get("curriculum",{}).get("math_day",1)))
     _reading_register_result(user, pages, sec, score, day)
 
-    # avança cursor (+3 sem 'min' para permitir finalizar o livro)
+    # avança cursor
     st["cursor"] = int(st["cursor"] or 1) + 3
     st["awaiting_audio"] = False
     st["last_pages"] = None
 
-    # Fecha o dia: sincroniza próximos dias de MAT/PT e notifica responsáveis
+    # Fecha o dia
     cur_pt  = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
     cur_mat = user.setdefault("curriculum",   {"math_day": 1, "total_days": MAX_MATH_DAY})
     current_day = int(day)
@@ -872,16 +920,16 @@ def _check_math_batch(user, text: str):
         batch2 = _start_math_batch_for_day(user, day, next_round)
         return True, f"✅ Rodada {round_idx}/{rounds_total} concluída! Vamos para a *Rodada {next_round}/{rounds_total}*.\n\n" + _format_math_prompt(batch2)
 
-    # Finalizou as 5 de MAT
     user["levels"]["matematica"] = user["levels"].get("matematica", 0) + 1
 
-    if FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH:
+    if FEATURE_PORTUGUES && AUTO_SEQUENCE_PT_AFTER_MATH:
         user["pending"].pop("pt_lote", None)
         cur_pt = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
         cur_pt["pt_day"] = day
         batch2 = _start_pt_batch_for_day(user, day, 1)
         return True, f"🎉 *Matemática do dia {day} concluída!* Agora vamos para *Português* (5 rodadas).\n\n" + _format_pt_prompt(batch2)
 
+    # Se Português desligado, fechar dia aqui (raro)
     _close_day_and_notify(user, day)
     cur = user.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
     next_day = min(MAX_MATH_DAY, int(cur.get("math_day",1)) + 1)
@@ -939,6 +987,7 @@ def _check_pt_batch(user, text: str):
         msg = _reading_start_for_user(user)
         return True, f"🎉 *Português do dia {day} concluído!* Agora vamos para *Leitura*.\n\n{msg}"
 
+    # Se leitura desativada, fechar dia aqui
     cur_pt  = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
     cur_mat = user.setdefault("curriculum",   {"math_day": 1, "total_days": MAX_MATH_DAY})
     current_day = int(pend.get("day", day))
@@ -1040,9 +1089,11 @@ def ob_step(user, text: str) -> str:
         elif field == "nome":
             data["child_name"] = val
         elif field == "idade":
-            a = age_from_text(val)
+            a = re.search(r"(\d{1,2})", val or "")
             if not a: return "Idade inválida. Envie um número entre 3 e 13."
-            data["age"] = a
+            aa = int(a.group(1))
+            if not (3 <= aa <= 13): return "Idade inválida. Envie um número entre 3 e 13."
+            data["age"] = aa
         elif field == "domingo":
             yn = parse_yes_no(val)
             if yn is None: return "Responda *sim* ou *não* para *domingo:*"
@@ -1072,9 +1123,11 @@ def ob_step(user, text: str) -> str:
         return f"Perfeito, *{data['child_name']}*! 😊\nQuantos *anos* ela tem?"
 
     if step == "age":
-        a = age_from_text(text)
+        a = re.search(r"(\d{1,2})", text or "")
         if not a: return "Idade inválida. Envie um número entre 3 e 13."
-        data["age"] = a; st["data"] = data; st["step"] = "grade"
+        aa = int(a.group(1))
+        if not (3 <= aa <= 13): return "Idade inválida. Envie um número entre 3 e 13."
+        data["age"] = aa; st["data"] = data; st["step"] = "grade"
         return ("E em qual *série/ano* ela está?\n"
                 "Escolha ou escreva:\n"
                 "• Infantil 4 (Pré-I)\n• Infantil 5 (Pré-II)\n"
@@ -1131,6 +1184,8 @@ def ob_step(user, text: str) -> str:
             user.setdefault("curriculum_pt",{"pt_day":   1, "total_days": MAX_PT_DAY})
             user["onboarding"] = {"step": None, "data": {}}
             user.setdefault("daily_flags", {})
+            # notificar responsáveis pelo cadastro concluído
+            _notify_guardians_onboarding(user)
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
                     "Envie *iniciar* (Matemática). Depois vem *Português* e *Leitura* automaticamente.")
         elif t in {"não","nao"}:
@@ -1146,11 +1201,89 @@ def ob_step(user, text: str) -> str:
     st["step"] = None
     return ob_start()
 
-# ------------------- Web -------------------
+# ------------------- Admin / Health / Backup / Cron -------------------
 @app.route("/admin/ping")
 def ping():
     return jsonify({"project": PROJECT_NAME, "ok": True}), 200
 
+@app.route("/admin/export")
+def admin_export_db():
+    db = load_db()
+    return Response(json.dumps(db, ensure_ascii=False, indent=2),
+                    mimetype="application/json", status=200)
+
+@app.route("/admin/backup")
+def admin_manual_backup():
+    db = load_db()
+    path = _snapshot_db(db)
+    return jsonify({"ok": bool(path), "path": path}), 200
+
+@app.route("/admin/cron/minutely")
+def admin_cron_minutely():
+    """
+    Rode isso a cada 1 min (Railway cron/uptimer/etc).
+    - 5 min antes do horário: lembrete para a criança (se houver número)
+    - 3h depois do horário: alerta de atraso p/ responsáveis (se não concluiu)
+    """
+    db = load_db()
+    users = db.get("users", {})
+    processed = []
+    for uid, user in users.items():
+        try:
+            prof = user.get("profile", {})
+            sched = prof.get("schedule") or {}
+            days  = sched.get("days") or []
+            times = sched.get("times") or {}
+            tz = _user_tz(user)
+            now_local = _now(user)
+
+            # Qual o dia da semana hoje?
+            weekday_key = ["mon","tue","wed","thu","fri","sat","sun"][now_local.weekday()]
+            if weekday_key not in days: 
+                continue
+            hhmm = times.get(weekday_key)
+            if not hhmm:
+                continue
+
+            # horário alvo hoje
+            hh, mm = [int(x) for x in hhmm.split(":")]
+            target = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+            dk = _today_key(user)
+            flags = user.setdefault("daily_flags", {}).setdefault(dk, {
+                "report_sent": False, "completed": False,
+                "reminder_sent": False, "late_warn_sent": False,
+                "child_motiv_sent": False
+            })
+
+            # 5 min antes -> lembrete
+            delta_to_target = (target - now_local).total_seconds()
+            if 0 < delta_to_target <= REMINDER_MINUTES_BEFORE*60 and not flags.get("reminder_sent"):
+                child = prof.get("child_phone")
+                if child:
+                    link = _wa_click_link("iniciar")
+                    suffix = f"\n\n👉 *Toque para iniciar:* {link}" if link else "\n\nDigite: *iniciar*"
+                    nome = first_name_from_profile(user).title()
+                    _send_message(child, f"⏰ Lembrete: em {REMINDER_MINUTES_BEFORE} min começamos as atividades, {nome}!{suffix}")
+                    flags["reminder_sent"] = True
+
+            # +3h após horário -> atraso (se não concluiu)
+            if (now_local - target).total_seconds() >= LATE_HOURS_AFTER*3600 and not flags.get("completed") and not flags.get("late_warn_sent"):
+                nome = first_name_from_profile(user).title()
+                for g in _guardians_list(user):
+                    _send_message(g, f"⚠️ Aviso: {nome} ainda não realizou as atividades de hoje. Se precisar, responda aqui que posso ajudar.")
+                flags["late_warn_sent"] = True
+
+            processed.append(uid)
+        except Exception:
+            # não derruba toda a rodada se um usuário quebrar
+            continue
+
+    db["users"] = users
+    save_db(db)
+    return jsonify({"ok": True, "processed": processed, "count": len(processed)}), 200
+
+# ------------------- Webhook principal -------------------
 def _curriculum_phase_title(day_idx: int) -> str:
     spec = _curriculum_spec(day_idx)
     return spec["phase"]
@@ -1194,6 +1327,7 @@ def bot_webhook():
             "levels": {"matematica": 0, "portugues": 0, "leitura": 0},
             "history": {"matematica": [], "portugues": [], "leitura": []},
             "daily_flags": {},
+            "streak": {"count": 0, "last_date": None},
             "reading": {
                 "selected_book": None, "total_pages": 0,
                 "start_page": None, "cursor": None,
@@ -1218,16 +1352,33 @@ def bot_webhook():
 
     # -------- Comandos --------
     if low in {"menu","ajuda","help"}:
+        link = _wa_click_link("iniciar")
+        start_hint = f"👉 *Toque para iniciar:* {link}" if link else "Digite *iniciar* para começar."
         reply = (
             f"Fluxo do dia: *5 Matemática* → *5 Português* → *Leitura* (3 páginas) → fim do dia.\n\n"
             "MAT: 1) Adição  2) Subtração  3) Multiplicação  4) Divisão  5) Mista.\n"
             "PT : 1) Som inicial  2) Sílabas  3) Decodificação  4) Ortografia  5) Leitura.\n"
-            f"LEITURA: escolha 1 PDF ({BOOKS_DIR}), 3 páginas sequenciais por sessão, áudio ≥ {MIN_AUDIO_SEC}s, nota > 8.\n\n"
-            "Responda em *CSV* (vírgulas) nos módulos de MAT/PT ou envie *ok* para pular.\n"
+            f"LEITURA: escolha 1 PDF ({BOOKS_DIR}), áudio ≥ {MIN_AUDIO_SEC}s, nota > 8.\n\n"
+            f"{start_hint}\n"
             "Comandos: *iniciar*, *iniciar pt*, *iniciar leitura*, *livros*, *escolher <número>*, *inicio <n>*, "
-            "*resposta ...*, *ok*, *status*, *debug*, *reiniciar*, *reiniciar pt*, *#resetar*."
+            "*resposta ...*, *ok*, *status*, *reiniciar*, *reiniciar pt*, *#resetar*."
         )
         return reply_twiml(reply)
+
+    if low == "status":
+        streak = user.get("streak", {}).get("count", 0)
+        dk = _today_key(user)
+        flags = user.get("daily_flags", {}).get(dk, {})
+        mat_day = user.get("curriculum",{}).get("math_day",1)
+        pt_day  = user.get("curriculum_pt",{}).get("pt_day",1)
+        done = "sim" if flags.get("completed") else "não"
+        return reply_twiml(
+            f"📊 *Status*\n"
+            f"• Dia Matemática: {mat_day}\n"
+            f"• Dia Português: {pt_day}\n"
+            f"• Concluído hoje: {done}\n"
+            f"• Streak: {streak} dia(s)\n"
+        )
 
     # ========== LEITURA — utilitários/controle ==========
     st_read = _reading_state(user)
@@ -1237,7 +1388,6 @@ def bot_webhook():
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg)
 
-    # seleção numérica: "escolher 2" ou "livro 2"
     m_sel_num = re.match(r"^(?:escolher|livro)\s+(\d+)$", low)
     if m_sel_num:
         num = int(m_sel_num.group(1))
@@ -1245,7 +1395,6 @@ def bot_webhook():
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg)
 
-    # atalho: se a lista foi mostrada e o usuário manda só "2"
     m_only_num = re.match(r"^(\d{1,3})$", low)
     if m_only_num and (st_read.get("menu") or not st_read.get("selected_book")):
         num = int(m_only_num.group(1))
@@ -1253,7 +1402,6 @@ def bot_webhook():
         db["users"][user_id] = user; save_db(db)
         return reply_twiml(msg)
 
-    # compat: escolher por nome (ainda aceito, mas preferimos número)
     m_sel_name = re.match(r"^escolher\s+livro\s+(.+)$", low)
     if m_sel_name:
         name = m_sel_name.group(1).strip()
@@ -1289,7 +1437,9 @@ def bot_webhook():
         batch = _start_math_batch_for_day(user, day, 1)
         db["users"][user_id] = user; save_db(db)
         nome = first_name_from_profile(user)
-        saudacao = f"Olá, {nome}! Vamos iniciar *Matemática* de hoje (5 rodadas). 👋"
+        link = _wa_click_link("iniciar")
+        touch = f"\n\n👉 Se preferir, toque aqui sempre que quiser começar: {link}" if link else ""
+        saudacao = f"Olá, {nome}! Vamos iniciar *Matemática* de hoje (5 rodadas). 👋{touch}"
         return reply_twiml(saudacao + "\n\n" + _format_math_prompt(batch))
 
     if low in {"iniciar pt","pt iniciar","iniciar português","iniciar portugues"}:
@@ -1309,8 +1459,7 @@ def bot_webhook():
         batch = _start_pt_batch_for_day(user, day, 1)
         db["users"][user_id] = user; save_db(db)
         nome = first_name_from_profile(user)
-        saudacao = f"Olá, {nome}! Vamos iniciar *Português* de hoje (5 rodadas). 👋"
-        return reply_twiml(saudacao + "\n\n" + _format_pt_prompt(batch))
+        return reply_twiml(f"Olá, {nome}! Vamos iniciar *Português* de hoje (5 rodadas). 👋\n\n" + _format_pt_prompt(batch))
 
     # -------- Respostas MAT/PT --------
     if low in {"ok","ok!","ok."} and ("pt_lote" not in user.get("pending", {}) and "mat_lote" not in user.get("pending", {})):
@@ -1347,8 +1496,10 @@ def bot_webhook():
     except Exception:
         pass
 
-    return reply_twiml("Envie *iniciar* (Matemática). O fluxo é: MAT → PT → LEITURA (3 páginas).")
+    # fallback
+    link = _wa_click_link("iniciar")
+    hint = f"👉 *Toque para iniciar:* {link}" if link else "Digite *iniciar* para começar."
+    return reply_twiml(f"Envie *iniciar* (Matemática). O fluxo é: MAT → PT → LEITURA (3 páginas).\n{hint}")
 
 if __name__ == "__main__":
-    # Railway define PORT automaticamente
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
