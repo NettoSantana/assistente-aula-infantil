@@ -159,9 +159,6 @@ def _normalize_inbound_from(raw_from: str) -> str:
         return f"+55{d}" if not d.startswith("55") else f"+{d}"
     return f"+{d}"
 
-def _phones_equal(a: Optional[str], b: Optional[str]) -> bool:
-    return _digits_only(a or "") == _digits_only(b or "")
-
 def _wa_click_link(preset_text: str = "iniciar") -> Optional[str]:
     """Gera link wa.me com texto presetado (fallback para 'iniciar' clicável)."""
     try:
@@ -304,47 +301,51 @@ def _update_streak_on_complete(user):
     st["last_date"] = today
 
 # ============================================================
-# ======== Resolução de conta: SEMPRE a conta da CRIANÇA =====
+# ======== Índice de telefones: 1 conta por criança ==========
 # ============================================================
-def _find_child_account_for_sender(db: dict, sender_num: str) -> Tuple[str, str]:
+def _strip_channel_prefix(s: str) -> str:
+    s = (s or "").strip()
+    return s.replace("whatsapp:", "") if s.lower().startswith("whatsapp:") else s
+
+def _to_e164_or_none(num: str) -> Optional[str]:
+    return normalize_phone(_strip_channel_prefix(num))
+
+def _index_phones_for_user(db: dict, uid: str, user: dict):
     """
-    Retorna (account_id, role)
-    - account_id é SEMPRE o id da conta da CRIANÇA (se conhecida).
-    - role: "child" | "guardian" | "unknown"
+    Garante que TODOS os telefones (criança + responsáveis + o próprio uid se for número)
+    apontem para o MESMO uid canônico.
     """
-    users: Dict[str, Any] = db.get("users", {})
-    # 1) Se já existe conta com esse id (exato)
-    if sender_num in users:
-        u = users[sender_num]
-        child_phone = (u.get("profile", {}) or {}).get("child_phone")
-        if _phones_equal(child_phone, sender_num):
-            return sender_num, "child"
+    idx = db.setdefault("phone_index", {})
+    prof = user.get("profile", {}) or {}
+    phones = []
+    if prof.get("child_phone"):
+        p = _to_e164_or_none(prof.get("child_phone"))
+        if p: phones.append(p)
+    for g in (prof.get("guardians") or []):
+        p = _to_e164_or_none(g)
+        if p: phones.append(p)
+    pid = _to_e164_or_none(uid)
+    if pid: phones.append(pid)
+    for p in set(phones):
+        idx[p] = uid
 
-    # 2) Procurar por child_phone igual ao remetente
-    for uid, u in users.items():
-        child_phone = (u.get("profile", {}) or {}).get("child_phone")
-        if _phones_equal(child_phone, sender_num):
-            return uid, "child"
-
-    # 3) Procurar se o remetente é um dos responsáveis de alguma conta (então devolve a conta da criança)
-    for uid, u in users.items():
-        guardians = (u.get("profile", {}) or {}).get("guardians") or []
-        if any(_phones_equal(g, sender_num) for g in guardians):
-            child_phone = (u.get("profile", {}) or {}).get("child_phone")
-            # canonicaliza account_id para o número da criança se houver
-            if child_phone:
-                return child_phone, "guardian"
-            return uid, "guardian"
-
-    # 4) Não achou vínculo → usar o próprio número (ainda sem papel)
-    return sender_num, "unknown"
+def _resolve_uid_for_incoming(db: dict, from_number_raw: str) -> str:
+    """
+    Resolve o uid canônico a partir do número que mandou mensagem (criança ou responsável).
+    Se já existir no índice, usa o uid existente; senão, usa o próprio número como uid.
+    """
+    idx = db.setdefault("phone_index", {})
+    e164 = _to_e164_or_none(from_number_raw) or _normalize_inbound_from(from_number_raw)
+    uid = idx.get(e164) or e164
+    idx[e164] = uid  # já fixa este número para o uid (evita contas paralelas)
+    return uid
 
 def _account_is_ready(user: dict) -> bool:
     return not needs_onboarding(user)
 
 def _is_from_child(sender_num: str, user: dict) -> bool:
     child = (user.get("profile", {}) or {}).get("child_phone")
-    return _phones_equal(sender_num, child)
+    return _digits_only(sender_num) == _digits_only(child or "")
 
 def _send_child_welcome(user):
     child = (user.get("profile", {}) or {}).get("child_phone")
@@ -1308,9 +1309,12 @@ def admin_cron_minutely():
     processed = []
     for uid, user in users.items():
         try:
+            # mantém o índice de telefones coerente
+            _index_phones_for_user(db, uid, user)
+
             prof = user.get("profile", {})
             sched = prof.get("schedule") or {}
-            days  = sched.get("days") or []
+            days  = sched.get("days") or {}
             times = sched.get("times") or {}
             now_local = _now(user)
 
@@ -1368,14 +1372,16 @@ def _curriculum_phase_title(day_idx: int) -> str:
 def bot_webhook():
     payload = request.form or request.json or {}
     raw_from = str(payload.get("From") or payload.get("user_id") or "debug-user")
-    sender_num = _normalize_inbound_from(raw_from)  # SEMPRE número E.164 da mensagem recebida
+    sender_num = _normalize_inbound_from(raw_from)  # E.164 do remetente (para checar papel)
     text = (payload.get("Body") or payload.get("text") or "").strip()
     low = text.lower()
 
     db = load_db()
-    # resolve SEMPRE para a conta da CRIANÇA (se conhecida)
-    account_id, role = _find_child_account_for_sender(db, sender_num)
 
+    # 1) Resolve SEMPRE para o uid canônico via índice (criança ou responsável)
+    account_id = _resolve_uid_for_incoming(db, raw_from)
+
+    # 2) Carrega / cria o usuário canônico
     user = init_user_if_needed(db, account_id)
     user.setdefault("pending", {})
     user.setdefault("profile", {})
@@ -1395,6 +1401,11 @@ def bot_webhook():
     history.setdefault("leitura", [])
 
     user.setdefault("daily_flags", {})
+
+    # 3) Garante o índice atualizado (se já tinha perfil salvo)
+    _index_phones_for_user(db, account_id, user)
+    db["users"][account_id] = user
+    save_db(db)
 
     # -------- RESET TOTAL (#resetar) --------
     if low == "#resetar":
@@ -1427,7 +1438,10 @@ def bot_webhook():
             db["users"][account_id] = user; save_db(db)
             return reply_twiml(ob_start())
         reply = ob_step(user, text)
-        db["users"][account_id] = user; save_db(db)
+        # após ob_step, se perfil estiver completo, reindexa (para mapear child/guardians → uid)
+        db["users"][account_id] = user
+        _index_phones_for_user(db, account_id, user)
+        save_db(db)
         return reply_twiml(reply)
 
     # -------- Bloqueio para responsáveis (aula é no número da criança) --------
