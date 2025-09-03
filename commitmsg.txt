@@ -1,8 +1,7 @@
-﻿feat(pt): ativa módulo Português e integra ao fluxo
+﻿refactor(server): reestruturação completa do fluxo
 
-- comandos: iniciar pt, ok, resposta ...
-- PT: 5 rodadas/dia (som inicial, sílabas, decodificação, ortografia, leitura)
-- Temas rotativos: vogais, m/n, p/b, t/d, c/g (10 itens/rodada, CSV)
-- Correção/avanço/histórico independentes de Matemática
-- Menu/status/debug exibem ambos os módulos
-- Matemática mantida com roteiro progressivo (adição→subtração→multiplicação→divisão→mista)
+- Estrutura em seções claras (Twilio, onboarding, MAT/PT/Leitura, notificações)
+- Type hints amplas e docstrings para funções chave
+- Pequenos guards e normalizações (ex.: parsing de tempo/telefone, safe-fallback)
+- Reuso de helpers e remoção de duplicações triviais
+- Mantidos endpoints, textos, fluxos e regras de negócio
