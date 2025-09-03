@@ -29,7 +29,11 @@ from twilio.rest import Client
 
 # PDF e áudio
 import requests
-from mutagen import File as MutagenFile
+# >>> mutagen agora é opcional
+try:
+    from mutagen import File as MutagenFile  # type: ignore
+except Exception:
+    MutagenFile = None  # type: ignore
 try:
     from pypdf import PdfReader
 except Exception:
@@ -814,7 +818,7 @@ def _handle_audio_submission(user, payload) -> Optional[str]:
 
         sec = None
         try:
-            au = MutagenFile(fpath)
+            au = MutagenFile(fpath) if MutagenFile else None
             if au and getattr(au, "info", None) and getattr(au.info, "length", None):
                 sec = float(au.info.length)
         except Exception:
@@ -922,7 +926,8 @@ def _check_math_batch(user, text: str):
 
     user["levels"]["matematica"] = user["levels"].get("matematica", 0) + 1
 
-    if FEATURE_PORTUGUES && AUTO_SEQUENCE_PT_AFTER_MATH:
+    # >>> aqui estava "&&": corrigido para "and"
+    if FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH:
         user["pending"].pop("pt_lote", None)
         cur_pt = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
         cur_pt["pt_day"] = day
