@@ -1,7 +1,4 @@
-﻿refactor(server): reestruturação completa do fluxo
+﻿fix(phone-index): evitar UIDs duplicados + reset agressivo (#resetar)
 
-- Estrutura em seções claras (Twilio, onboarding, MAT/PT/Leitura, notificações)
-- Type hints amplas e docstrings para funções chave
-- Pequenos guards e normalizações (ex.: parsing de tempo/telefone, safe-fallback)
-- Reuso de helpers e remoção de duplicações triviais
-- Mantidos endpoints, textos, fluxos e regras de negócio
+UID resolver agora varre phone_index, UID existente e perfis (child/guardians) antes de criar novo.
+#resetar remove duplicados relacionados, recria conta zerada e remapeia números → UID canônico.

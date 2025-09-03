@@ -9,7 +9,7 @@
 #   • GET  /admin/ping | /admin/export | /admin/backup
 
 import os, re, json, random, tempfile, shutil, subprocess
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from flask import Flask, request, jsonify, Response
 from storage import load_db, save_db
 from progress import init_user_if_needed
@@ -284,7 +284,7 @@ def _update_streak_on_complete(user):
     st["count"] = (int(st.get("count") or 0) + 1) if last == yday else 1
     st["last_date"] = today
 
-# ========================= Índice de telefones =========================
+# ========================= Índice de telefones / Unificação =========================
 def _strip_channel_prefix(s: str) -> str:
     s = (s or "").strip()
     return s.replace("whatsapp:", "") if s.lower().startswith("whatsapp:") else s
@@ -308,20 +308,207 @@ def _index_phones_for_user(db: dict, uid: str, user: dict):
     for p in set(phones):
         idx[p] = uid
 
+def _is_e164_like(s: str) -> bool:
+    return bool(re.fullmatch(r"\+\d{10,15}", str(s or "")))
+
+def _collect_numbers_for_user(user: dict) -> Set[str]:
+    nums: Set[str] = set()
+    prof = (user.get("profile") or {})
+    c = _to_e164_or_none(prof.get("child_phone") or "")
+    if c: nums.add(c)
+    for g in (prof.get("guardians") or []):
+        gn = _to_e164_or_none(g)
+        if gn: nums.add(gn)
+    return nums
+
+def _find_uids_touching_numbers(db: dict, nums: Set[str]) -> Set[str]:
+    """Acha UIDs que tocam qualquer um dos números (phone_index e perfis)."""
+    users = db.get("users", {}) or {}
+    idx = db.setdefault("phone_index", {})
+    digs = {_digits_only(n) for n in nums if n}
+    uids: Set[str] = set()
+
+    # via índice
+    for n, uid in idx.items():
+        if _digits_only(n) in digs:
+            uids.add(uid)
+
+    # via perfis
+    for uid2, user2 in users.items():
+        prof2 = (user2.get("profile") or {})
+        c2 = _to_e164_or_none(prof2.get("child_phone") or "")
+        if c2 and _digits_only(c2) in digs:
+            uids.add(uid2)
+        for g2 in (prof2.get("guardians") or []):
+            g2n = _to_e164_or_none(g2)
+            if g2n and _digits_only(g2n) in digs:
+                uids.add(uid2)
+
+    # se algum número é o próprio UID numérico
+    for n in list(nums):
+        if n in users:
+            uids.add(n)
+
+    return uids
+
+def _choose_canonical_uid(db: dict, candidates: Set[str], incoming_e164: Optional[str]) -> str:
+    """Prefere um UID não-numérico; senão, usa o incoming; senão, o menor lexicográfico."""
+    if not candidates:
+        return incoming_e164 or "debug-user"
+    non_numeric = [u for u in candidates if not _is_e164_like(u)]
+    if non_numeric:
+        return sorted(non_numeric)[0]
+    if incoming_e164 and incoming_e164 in candidates:
+        return incoming_e164
+    return sorted(candidates)[0]
+
+def _merge_profiles(p_dst: dict, p_src: dict) -> dict:
+    dst = dict(p_dst or {})
+    src = dict(p_src or {})
+    # Preferir valores existentes; unir listas
+    if not dst.get("child_name") and src.get("child_name"):
+        dst["child_name"] = src["child_name"]
+    if not dst.get("age") and src.get("age"):
+        dst["age"] = src["age"]
+    if not dst.get("grade") and src.get("grade"):
+        dst["grade"] = src["grade"]
+    # child_phone: se vazio em dst, pega do src
+    if not dst.get("child_phone") and src.get("child_phone"):
+        dst["child_phone"] = src.get("child_phone")
+    # guardians: união
+    g1 = list(dst.get("guardians") or [])
+    g2 = list(src.get("guardians") or [])
+    merged = []
+    seen = set()
+    for g in g1 + g2:
+        n = _to_e164_or_none(g)
+        key = _digits_only(n or g or "")
+        if key and key not in seen:
+            seen.add(key); merged.append(n or g)
+    if merged:
+        dst["guardians"] = merged[:2]
+    # tz
+    if not dst.get("tz") and src.get("tz"):
+        dst["tz"] = src["tz"]
+    # schedule: merge times por dia
+    s1 = dst.get("schedule") or {}
+    s2 = src.get("schedule") or {}
+    days = s1.get("days") or []
+    days2 = s2.get("days") or []
+    days_merged = []
+    for d in DAY_ORDER:
+        if d in days or d in days2:
+            days_merged.append(d)
+    times = dict(s1.get("times") or {})
+    for d, t in (s2.get("times") or {}).items():
+        times.setdefault(d, t)
+    if days_merged or times:
+        dst["schedule"] = {"days": days_merged or DEFAULT_DAYS.copy(), "times": times}
+    return dst
+
+def _merge_simple_max(a: Optional[int], b: Optional[int]) -> int:
+    return max(int(a or 0), int(b or 0))
+
+def _merge_users_into_canonical(db: dict, canonical_uid: str, uids_to_merge: Set[str], numbers_to_bind: Set[str]):
+    """Funde users[u] em users[canonical_uid], remove duplicados e reindexa phone_index."""
+    users = db.setdefault("users", {})
+    idx = db.setdefault("phone_index", {})
+
+    base = users.get(canonical_uid, {
+        "profile": {}, "onboarding": {"step": None, "data": {}},
+        "pending": {}, "curriculum": {"math_day": 1, "total_days": MAX_MATH_DAY},
+        "curriculum_pt": {"pt_day": 1, "total_days": MAX_PT_DAY},
+        "levels": {"matematica": 0, "portugues": 0, "leitura": 0},
+        "history": {"matematica": [], "portugues": [], "leitura": []},
+        "daily_flags": {}, "streak": {"count": 0, "last_date": None},
+        "reading": {"selected_book": None, "total_pages": 0, "start_page": None, "cursor": None,
+                    "last_pages": None, "awaiting_audio": False, "menu": []}
+    })
+
+    for uid in list(uids_to_merge):
+        if uid == canonical_uid:
+            continue
+        u = users.get(uid)
+        if not u:
+            continue
+
+        # profile: merge
+        base["profile"] = _merge_profiles(base.get("profile", {}), u.get("profile", {}))
+
+        # curriculum / pt: manter maior dia
+        curA = base.setdefault("curriculum", {"math_day": 1, "total_days": MAX_MATH_DAY})
+        curB = u.get("curriculum", {})
+        curA["math_day"] = _merge_simple_max(curA.get("math_day"), curB.get("math_day"))
+        curA["total_days"] = MAX_MATH_DAY
+
+        curPA = base.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
+        curPB = u.get("curriculum_pt", {})
+        curPA["pt_day"] = _merge_simple_max(curPA.get("pt_day"), curPB.get("pt_day"))
+        curPA["total_days"] = MAX_PT_DAY
+
+        # levels: somar
+        levA = base.setdefault("levels", {"matematica":0,"portugues":0,"leitura":0})
+        levB = u.get("levels", {})
+        for k in ("matematica","portugues","leitura"):
+            levA[k] = int(levA.get(k,0)) + int((levB or {}).get(k,0))
+
+        # history: concatenar
+        hA = base.setdefault("history", {"matematica": [], "portugues": [], "leitura": []})
+        hB = u.get("history", {})
+        for k in ("matematica","portugues","leitura"):
+            hA.setdefault(k, [])
+            for item in (hB.get(k) or []):
+                hA[k].append(item)
+
+        # daily_flags: preferir os do canônico; completar chaves ausentes
+        dfA = base.setdefault("daily_flags", {})
+        dfB = u.get("daily_flags", {})
+        for dayk, flags in (dfB or {}).items():
+            dfA.setdefault(dayk, {})
+            for fk, fv in (flags or {}).items():
+                dfA[dayk].setdefault(fk, fv)
+
+        # streak: manter maior contagem
+        stA = base.setdefault("streak", {"count": 0, "last_date": None})
+        stB = u.get("streak", {})
+        if int((stB or {}).get("count") or 0) > int((stA or {}).get("count") or 0):
+            base["streak"] = {"count": int((stB or {}).get("count") or 0), "last_date": (stB or {}).get("last_date")}
+
+        # reading: manter a que estiver em progresso; senão, preservar existente
+        rA = base.setdefault("reading", {})
+        rB = u.get("reading", {})
+        def _in_progress(r): 
+            try:
+                return bool((r or {}).get("selected_book") and int((r or {}).get("cursor") or 0) <= int((r or {}).get("total_pages") or 0))
+            except Exception:
+                return False
+        if _in_progress(rB) and not _in_progress(rA):
+            base["reading"] = rB
+
+        # pending: descartamos do duplicado
+        # onboarding: mantém do canônico
+
+        # por fim, remover duplicado
+        if uid in users:
+            users.pop(uid, None)
+
+    # salva canônico
+    users[canonical_uid] = base
+
+    # reindexar todos os números conhecidos
+    related_nums = set(numbers_to_bind)
+    related_nums |= _collect_numbers_for_user(base)
+    for n in list(related_nums):
+        if n:
+            idx[n] = canonical_uid
+
 def _collect_related_numbers_and_uids(db: dict, uid: str):
-    """
-    Coleta todos os números e UIDs conectados ao uid:
-    - child_phone e guardians do perfil
-    - números do phone_index que já apontam pra esse uid
-    - UIDs cujo id é um desses números
-    - UIDs de usuários cujos perfis contenham esses números
-    """
+    """Mantida (usada no #resetar)."""
     users = db.get("users", {}) or {}
     idx = db.setdefault("phone_index", {})
     nums = set()
     uids = set([uid])
 
-    # 1) Perfil do uid atual
     user = users.get(uid, {}) or {}
     prof = (user.get("profile") or {})
     child = _to_e164_or_none(prof.get("child_phone") or "")
@@ -330,17 +517,14 @@ def _collect_related_numbers_and_uids(db: dict, uid: str):
         gnorm = _to_e164_or_none(g)
         if gnorm: nums.add(gnorm)
 
-    # 2) Números do índice que já apontam pra este uid
     for num, mapped_uid in idx.items():
         if mapped_uid == uid:
             nums.add(num)
 
-    # 3) UIDs cujo id é um número desses
     for n in list(nums):
         if n in users:
             uids.add(n)
 
-    # 4) Outros UIDs cujos perfis referenciam algum desses números
     if nums:
         digs = {_digits_only(n) for n in nums}
         for uid2, user2 in users.items():
@@ -357,42 +541,43 @@ def _collect_related_numbers_and_uids(db: dict, uid: str):
 
 def _resolve_uid_for_incoming(db: dict, from_number_raw: str) -> str:
     """
-    Resolve uid canônico a partir do número que enviou a mensagem.
+    Resolve uid canônico a partir do número que enviou a mensagem e
+    UNIFICA possíveis duplicados.
     Estratégia:
-      1) Se o número está no phone_index → usa o uid mapeado
-      2) Se existe user com uid == número → usa esse
-      3) Varrer perfis (child_phone/guardians) para achar o dono e mapear
-      4) Caso contrário, cria um uid novo com o próprio número
+      - Normaliza E.164 do remetente (e164)
+      - Coleta todos UIDs que tocam esse número (phone_index + perfis + UID numérico)
+      - Escolhe um UID canônico estável
+      - Faz merge de todos os UIDs → canônico e reindexa números
     """
     idx = db.setdefault("phone_index", {})
+    users = db.setdefault("users", {})
+
     e164 = _to_e164_or_none(from_number_raw) or _normalize_inbound_from(from_number_raw)
-    users = db.get("users", {}) or {}
+    if not e164:
+        e164 = _normalize_inbound_from(from_number_raw)
 
-    # 1) phone_index
-    if e164 in idx:
-        return idx[e164]
+    origin_nums = {e164} if e164 else set()
+    uids_found = _find_uids_touching_numbers(db, origin_nums)
 
-    # 2) uid numérico já existente
-    if e164 in users:
+    # se não achou ninguém, cria uid usando o próprio e164
+    if not uids_found:
         idx[e164] = e164
+        if e164 not in users:
+            users[e164] = {
+                "profile": {}, "onboarding": {"step": None, "data": {}},
+                "pending": {}, "curriculum": {"math_day": 1, "total_days": MAX_MATH_DAY},
+                "curriculum_pt": {"pt_day": 1, "total_days": MAX_PT_DAY},
+                "levels": {"matematica": 0, "portugues": 0, "leitura": 0},
+                "history": {"matematica": [], "portugues": [], "leitura": []},
+                "daily_flags": {}, "streak": {"count": 0, "last_date": None},
+                "reading": {"selected_book": None, "total_pages": 0, "start_page": None, "cursor": None,
+                            "last_pages": None, "awaiting_audio": False, "menu": []}
+            }
         return e164
 
-    # 3) varre perfis para achar dono
-    for uid0, user0 in users.items():
-        prof = (user0.get("profile") or {})
-        child = _to_e164_or_none(prof.get("child_phone") or "")
-        if child and _digits_only(child) == _digits_only(e164):
-            idx[e164] = uid0
-            return uid0
-        for g in (prof.get("guardians") or []):
-            gnorm = _to_e164_or_none(g)
-            if gnorm and _digits_only(gnorm) == _digits_only(e164):
-                idx[e164] = uid0
-                return uid0
-
-    # 4) não achou → cria uid com o próprio número
-    idx[e164] = e164
-    return e164
+    canonical = _choose_canonical_uid(db, uids_found, e164)
+    _merge_users_into_canonical(db, canonical, uids_found, origin_nums)
+    return canonical
 
 def _account_is_ready(user: dict) -> bool:
     return not needs_onboarding(user)
@@ -1421,7 +1606,7 @@ def bot_webhook():
 
     db = load_db()
 
-    # 1) Resolve uid canônico (criança ou responsável)
+    # 1) Resolve uid canônico (criança ou responsável) e unifica duplicados
     account_id = _resolve_uid_for_incoming(db, raw_from)
 
     # 2) Carrega / cria usuário
@@ -1452,18 +1637,15 @@ def bot_webhook():
 
     # -------- RESET TOTAL --------
     if low == "#resetar":
-        # Coleta números/UIDs relacionados e apaga duplicados
+        # Coleta números/UIDs relacionados e unifica no canônico
         idx = db.setdefault("phone_index", {})
         nums, uids = _collect_related_numbers_and_uids(db, account_id)
         if sender_num:
             nums.add(sender_num)
+        canonical = _choose_canonical_uid(db, set(uids), account_id)
+        _merge_users_into_canonical(db, canonical, set(uids), set(nums))
 
-        # Remove UIDs duplicados (mantém o uid atual)
-        for uid_del in list(uids):
-            if uid_del != account_id:
-                db.get("users", {}).pop(uid_del, None)
-
-        # Cria conta zerada no uid atual
+        # Cria conta zerada no canônico
         fresh = {
             "profile": {},
             "onboarding": {"step": "name", "data": {}},
@@ -1481,12 +1663,12 @@ def bot_webhook():
                 "menu": []
             }
         }
-        db["users"][account_id] = fresh
+        db["users"][canonical] = fresh
 
-        # Remapeia todos os números coletados → uid atual
-        for n in nums:
+        # Remapeia todos os números coletados → uid canônico
+        for n in set(nums):
             if n:
-                idx[n] = account_id
+                idx[n] = canonical
 
         save_db(db)
         return reply_twiml("♻️ Tudo resetado (criança + responsável). Vamos começar do zero.\n" + ob_start())
