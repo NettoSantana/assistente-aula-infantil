@@ -29,7 +29,7 @@ from twilio.rest import Client
 
 # PDF e áudio
 import requests
-# >>> mutagen agora é opcional
+# mutagen agora é opcional
 try:
     from mutagen import File as MutagenFile  # type: ignore
 except Exception:
@@ -142,6 +142,25 @@ def _ensure_channel_prefix(to: str) -> str:
 
 def _digits_only(num: str) -> str:
     return re.sub(r"\D", "", num or "")
+
+def _normalize_inbound_from(raw_from: str) -> str:
+    """Converte 'whatsapp:+551198...' -> '+551198...' e garante E.164 simplificado"""
+    s = (raw_from or "").strip()
+    if s.lower().startswith("whatsapp:"):
+        s = s.split(":", 1)[1]
+    s = re.sub(r"[^\d+]", "", s)
+    if s.startswith("+"):
+        return f"+{_digits_only(s)}"
+    # fallback: adiciona BR por padrão se vier sem +
+    d = _digits_only(s)
+    if not d:
+        return s
+    if len(d) >= 10:
+        return f"+55{d}" if not d.startswith("55") else f"+{d}"
+    return f"+{d}"
+
+def _phones_equal(a: Optional[str], b: Optional[str]) -> bool:
+    return _digits_only(a or "") == _digits_only(b or "")
 
 def _wa_click_link(preset_text: str = "iniciar") -> Optional[str]:
     """Gera link wa.me com texto presetado (fallback para 'iniciar' clicável)."""
@@ -283,6 +302,57 @@ def _update_streak_on_complete(user):
     else:
         st["count"] = 1
     st["last_date"] = today
+
+# ============================================================
+# ======== Resolução de conta: SEMPRE a conta da CRIANÇA =====
+# ============================================================
+def _find_child_account_for_sender(db: dict, sender_num: str) -> Tuple[str, str]:
+    """
+    Retorna (account_id, role)
+    - account_id é SEMPRE o id da conta da CRIANÇA (se conhecida).
+    - role: "child" | "guardian" | "unknown"
+    """
+    users: Dict[str, Any] = db.get("users", {})
+    # 1) Se já existe conta com esse id (exato)
+    if sender_num in users:
+        u = users[sender_num]
+        child_phone = (u.get("profile", {}) or {}).get("child_phone")
+        if _phones_equal(child_phone, sender_num):
+            return sender_num, "child"
+
+    # 2) Procurar por child_phone igual ao remetente
+    for uid, u in users.items():
+        child_phone = (u.get("profile", {}) or {}).get("child_phone")
+        if _phones_equal(child_phone, sender_num):
+            return uid, "child"
+
+    # 3) Procurar se o remetente é um dos responsáveis de alguma conta (então devolve a conta da criança)
+    for uid, u in users.items():
+        guardians = (u.get("profile", {}) or {}).get("guardians") or []
+        if any(_phones_equal(g, sender_num) for g in guardians):
+            child_phone = (u.get("profile", {}) or {}).get("child_phone")
+            # canonicaliza account_id para o número da criança se houver
+            if child_phone:
+                return child_phone, "guardian"
+            return uid, "guardian"
+
+    # 4) Não achou vínculo → usar o próprio número (ainda sem papel)
+    return sender_num, "unknown"
+
+def _account_is_ready(user: dict) -> bool:
+    return not needs_onboarding(user)
+
+def _is_from_child(sender_num: str, user: dict) -> bool:
+    child = (user.get("profile", {}) or {}).get("child_phone")
+    return _phones_equal(sender_num, child)
+
+def _send_child_welcome(user):
+    child = (user.get("profile", {}) or {}).get("child_phone")
+    if not child: return
+    nome = first_name_from_profile(user)
+    link = _wa_click_link("iniciar")
+    touch = f"\n\n👉 Toque para começar: {link}" if link else "\n\nDigite: *iniciar*"
+    _send_message(child, f"Olá, {nome}! Eu vou te acompanhar nas atividades. {touch}")
 
 # ============================================================
 # =================== MATEMÁTICA (progressivo) ===============
@@ -531,12 +601,16 @@ def _notify_guardians_onboarding(user):
     prof = user.get("profile", {})
     nome = (prof.get("child_name") or "a criança").title()
     sched = prof.get("schedule") or {}
+    child = prof.get("child_phone")
     msg = (f"✅ Cadastro concluído para *{nome}*.\n"
            f"Rotina: {describe_schedule(sched)}.\n"
-           "A partir de hoje: lembrete 5 min antes do horário, e relatório no fim do dia.\n"
+           f"As atividades serão feitas *pelo WhatsApp da criança*: {mask_phone(child)}.\n"
+           "A partir de hoje: lembrete 5 min antes do horário e relatório no fim do dia.\n"
            "Qualquer dúvida, responda aqui. Vamos juntos! 💪")
     for g in _guardians_list(user):
         _send_message(g, msg)
+    # dá um oi para a criança também
+    _send_child_welcome(user)
 
 def _child_motivational_text(user) -> str:
     nome = first_name_from_profile(user).title()
@@ -926,7 +1000,6 @@ def _check_math_batch(user, text: str):
 
     user["levels"]["matematica"] = user["levels"].get("matematica", 0) + 1
 
-    # >>> aqui estava "&&": corrigido para "and"
     if FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH:
         user["pending"].pop("pt_lote", None)
         cur_pt = user.setdefault("curriculum_pt", {"pt_day": 1, "total_days": MAX_PT_DAY})
@@ -1189,10 +1262,10 @@ def ob_step(user, text: str) -> str:
             user.setdefault("curriculum_pt",{"pt_day":   1, "total_days": MAX_PT_DAY})
             user["onboarding"] = {"step": None, "data": {}}
             user.setdefault("daily_flags", {})
-            # notificar responsáveis pelo cadastro concluído
+            # notificar responsáveis e dar boas-vindas à criança
             _notify_guardians_onboarding(user)
             return ("Maravilha! ✅ Cadastro e rotina definidos.\n"
-                    "Envie *iniciar* (Matemática). Depois vem *Português* e *Leitura* automaticamente.")
+                    "As atividades serão feitas pelo *WhatsApp da criança*. Envie *iniciar* do celular dela quando quiser começar.")
         elif t in {"não","nao"}:
             return ("Sem problema! Você pode corrigir assim:\n"
                     "• *nome:* Ana Souza\n• *idade:* 7\n• *serie:* 2º ano\n"
@@ -1239,12 +1312,11 @@ def admin_cron_minutely():
             sched = prof.get("schedule") or {}
             days  = sched.get("days") or []
             times = sched.get("times") or {}
-            tz = _user_tz(user)
             now_local = _now(user)
 
-            # Qual o dia da semana hoje?
+            # dia da semana hoje
             weekday_key = ["mon","tue","wed","thu","fri","sat","sun"][now_local.weekday()]
-            if weekday_key not in days: 
+            if weekday_key not in days:
                 continue
             hhmm = times.get(weekday_key)
             if not hhmm:
@@ -1261,7 +1333,7 @@ def admin_cron_minutely():
                 "child_motiv_sent": False
             })
 
-            # 5 min antes -> lembrete
+            # 5 min antes -> lembrete para CRIANÇA
             delta_to_target = (target - now_local).total_seconds()
             if 0 < delta_to_target <= REMINDER_MINUTES_BEFORE*60 and not flags.get("reminder_sent"):
                 child = prof.get("child_phone")
@@ -1272,7 +1344,7 @@ def admin_cron_minutely():
                     _send_message(child, f"⏰ Lembrete: em {REMINDER_MINUTES_BEFORE} min começamos as atividades, {nome}!{suffix}")
                     flags["reminder_sent"] = True
 
-            # +3h após horário -> atraso (se não concluiu)
+            # +3h após horário -> atraso (se não concluiu) para RESPONSÁVEIS
             if (now_local - target).total_seconds() >= LATE_HOURS_AFTER*3600 and not flags.get("completed") and not flags.get("late_warn_sent"):
                 nome = first_name_from_profile(user).title()
                 for g in _guardians_list(user):
@@ -1281,7 +1353,6 @@ def admin_cron_minutely():
 
             processed.append(uid)
         except Exception:
-            # não derruba toda a rodada se um usuário quebrar
             continue
 
     db["users"] = users
@@ -1296,12 +1367,16 @@ def _curriculum_phase_title(day_idx: int) -> str:
 @app.route("/bot", methods=["POST"])
 def bot_webhook():
     payload = request.form or request.json or {}
-    user_id = str(payload.get("From") or payload.get("user_id") or "debug-user")
+    raw_from = str(payload.get("From") or payload.get("user_id") or "debug-user")
+    sender_num = _normalize_inbound_from(raw_from)  # SEMPRE número E.164 da mensagem recebida
     text = (payload.get("Body") or payload.get("text") or "").strip()
     low = text.lower()
 
     db = load_db()
-    user = init_user_if_needed(db, user_id)
+    # resolve SEMPRE para a conta da CRIANÇA (se conhecida)
+    account_id, role = _find_child_account_for_sender(db, sender_num)
+
+    user = init_user_if_needed(db, account_id)
     user.setdefault("pending", {})
     user.setdefault("profile", {})
     user.setdefault("onboarding", {"step": None, "data": {}})
@@ -1340,7 +1415,7 @@ def bot_webhook():
                 "menu": []
             }
         }
-        db["users"][user_id] = fresh
+        db["users"][account_id] = fresh
         save_db(db)
         return reply_twiml("♻️ Tudo resetado. Vamos começar do zero.\n" + ob_start())
 
@@ -1349,13 +1424,54 @@ def bot_webhook():
         st = user["onboarding"]
         if st["step"] is None:
             st["step"] = "name"
-            db["users"][user_id] = user; save_db(db)
+            db["users"][account_id] = user; save_db(db)
             return reply_twiml(ob_start())
         reply = ob_step(user, text)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(reply)
 
-    # -------- Comandos --------
+    # -------- Bloqueio para responsáveis (aula é no número da criança) --------
+    if not _is_from_child(sender_num, user):
+        # permite só comandos informativos
+        if low in {"status","menu","ajuda","help"}:
+            if low == "status":
+                streak = user.get("streak", {}).get("count", 0)
+                dk = _today_key(user)
+                flags = user.get("daily_flags", {}).get(dk, {})
+                mat_day = user.get("curriculum",{}).get("math_day",1)
+                pt_day  = user.get("curriculum_pt",{}).get("pt_day",1)
+                done = "sim" if flags.get("completed") else "não"
+                msg = (f"📊 *Status de {first_name_from_profile(user).title()}*\n"
+                       f"• Dia Matemática: {mat_day}\n"
+                       f"• Dia Português: {pt_day}\n"
+                       f"• Concluído hoje: {done}\n"
+                       f"• Streak: {streak} dia(s)")
+            else:
+                link = _wa_click_link("iniciar")
+                start_hint = f"👉 *Toque para iniciar:* {link}" if link else "A criança deve digitar *iniciar* no celular dela."
+                msg = (
+                    "Fluxo do dia: *5 Matemática* → *5 Português* → *Leitura* (3 páginas).\n\n"
+                    "As atividades são feitas *pelo WhatsApp da CRIANÇA*.\n"
+                    f"{start_hint}"
+                )
+            # reforça com um ping para a criança
+            child = (user.get("profile", {}) or {}).get("child_phone")
+            if child:
+                _send_message(child, "Olá! Seu responsável pediu pra começar as atividades. Digite *iniciar* quando quiser.")
+            db["users"][account_id] = user; save_db(db)
+            return reply_twiml(msg)
+
+        # qualquer outro comando do responsável é bloqueado
+        child = (user.get("profile", {}) or {}).get("child_phone")
+        link = _wa_click_link("iniciar")
+        if child:
+            _send_message(child, "Ei! Bora estudar? Digite *iniciar* para começar as atividades de hoje. 💪")
+        msg = ("Este número é de *responsável*. As atividades devem ser feitas pelo *WhatsApp da criança*.\n"
+               f"Criança: {mask_phone(child)}.\n"
+               f"Envie *iniciar* a partir do celular dela. {('Link: ' + link) if link else ''}")
+        return reply_twiml(msg)
+
+    # -------- Comandos (só da criança aqui) --------
     if low in {"menu","ajuda","help"}:
         link = _wa_click_link("iniciar")
         start_hint = f"👉 *Toque para iniciar:* {link}" if link else "Digite *iniciar* para começar."
@@ -1390,57 +1506,57 @@ def bot_webhook():
 
     if low == "livros":
         msg = _reading_menu_text(user)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(msg)
 
     m_sel_num = re.match(r"^(?:escolher|livro)\s+(\d+)$", low)
     if m_sel_num:
         num = int(m_sel_num.group(1))
         msg = _reading_select_book(user, str(num))
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(msg)
 
     m_only_num = re.match(r"^(\d{1,3})$", low)
     if m_only_num and (st_read.get("menu") or not st_read.get("selected_book")):
         num = int(m_only_num.group(1))
         msg = _reading_select_book(user, str(num))
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(msg)
 
     m_sel_name = re.match(r"^escolher\s+livro\s+(.+)$", low)
     if m_sel_name:
         name = m_sel_name.group(1).strip()
         msg = _reading_select_book(user, name)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(msg)
 
     m_ini = re.match(r"^inicio\s+(\d+)$", low)
     if m_ini:
         n = int(m_ini.group(1))
         msg = _reading_set_start(user, n)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(msg)
 
     if low in {"iniciar leitura","leitura iniciar"}:
         msg = _reading_start_for_user(user)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(msg)
 
     # -------- Iniciar sessões MAT/PT --------
     if low == "iniciar":
         if "pt_lote" in user.get("pending", {}):
             batch = user["pending"]["pt_lote"]
-            db["users"][user_id] = user; save_db(db)
+            db["users"][account_id] = user; save_db(db)
             return reply_twiml("Estamos em *Português* agora. Conclua as 5 rodadas de PT.\n\n" + _format_pt_prompt(batch))
         if "mat_lote" in user.get("pending", {}):
             batch = user["pending"]["mat_lote"]
-            db["users"][user_id] = user; save_db(db)
+            db["users"][account_id] = user; save_db(db)
             return reply_twiml(_format_math_prompt(batch))
         day = int(user.get("curriculum",{}).get("math_day",1))
         if day > MAX_MATH_DAY:
             return reply_twiml("✅ Você já concluiu o plano até o *dia 60*. Envie *reiniciar* para começar de novo.")
         batch = _start_math_batch_for_day(user, day, 1)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         nome = first_name_from_profile(user)
         link = _wa_click_link("iniciar")
         touch = f"\n\n👉 Se preferir, toque aqui sempre que quiser começar: {link}" if link else ""
@@ -1450,19 +1566,19 @@ def bot_webhook():
     if low in {"iniciar pt","pt iniciar","iniciar português","iniciar portugues"}:
         if "mat_lote" in user.get("pending", {}):
             batch = user["pending"]["mat_lote"]
-            db["users"][user_id] = user; save_db(db)
+            db["users"][account_id] = user; save_db(db)
             return reply_twiml("Estamos em *Matemática* agora. Termine as 5 rodadas de MAT antes do Português.\n\n" + _format_math_prompt(batch))
         if not FEATURE_PORTUGUES:
             return reply_twiml("✍️ *Português* está desativado no momento.")
         if "pt_lote" in user.get("pending", {}):
             batch = user["pending"]["pt_lote"]
-            db["users"][user_id] = user; save_db(db)
+            db["users"][account_id] = user; save_db(db)
             return reply_twiml(_format_pt_prompt(batch))
         day = int(user.get("curriculum_pt",{}).get("pt_day",1))
         if day > MAX_PT_DAY:
             return reply_twiml("✅ Você já concluiu o plano de *Português*. Envie *reiniciar pt* para começar de novo.")
         batch = _start_pt_batch_for_day(user, day, 1)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         nome = first_name_from_profile(user)
         return reply_twiml(f"Olá, {nome}! Vamos iniciar *Português* de hoje (5 rodadas). 👋\n\n" + _format_pt_prompt(batch))
 
@@ -1479,7 +1595,7 @@ def bot_webhook():
             raw = text.split(" ", 1)[1].strip() if " " in text else ""
             raw = raw.lstrip(":.-").strip() or raw
         ok_flag, msg = _check_pt_batch(user, raw)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(msg)
 
     if "mat_lote" in user.get("pending", {}):
@@ -1488,15 +1604,16 @@ def bot_webhook():
             raw = text.split(" ", 1)[1].strip() if " " in text else ""
             raw = raw.lstrip(":.-").strip() or raw
         ok_flag, msg = _check_math_batch(user, raw)
-        db["users"][user_id] = user; save_db(db)
+        db["users"][account_id] = user; save_db(db)
         return reply_twiml(msg)
 
     # -------- Áudio (LEITURA) --------
     try:
         if int(payload.get("NumMedia", "0") or "0") > 0:
+            # só criança envia áudio; responsável já foi bloqueado antes
             msg = _handle_audio_submission(user, payload)
             if msg:
-                db["users"][user_id] = user; save_db(db)
+                db["users"][account_id] = user; save_db(db)
                 return reply_twiml(msg)
     except Exception:
         pass
