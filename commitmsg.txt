@@ -1,7 +1,7 @@
-﻿feat(educacional): fluxo de aula com múltipla escolha (5x Matemática + 1x Português) e comando 'começar aula'
+﻿fix(server): corrigir colchetes/chaves e finalizar fluxo de aula + check-in
 
-- Adiciona sessão de aula (user['lesson']) com MCQ simples (responder 1..4)
-- Comandos: começar/comecar/iniciar aula, cancelar aula; continua de onde parou
-- Ao finalizar: resumo de acertos e mark_day_done() (notifica responsáveis)
-- Mantém onboarding guiado e check-in diário (+3h do lembrete)
-- Mensagem WELCOME atualizada para expor o comando 'começar aula'
+- Corrige todas as anotações de tipo (Tuple[...] / Dict[...]) e parênteses
+- Onboarding guiado (múltipla escolha simples) restaurado
+- Fluxo de aula (5x Mat + 1x PT) com MCQ e mark_day_done() ao final
+- Check-in diário: aviso imediato e falta +3h do lembrete
+- Comandos: iniciar, começar/comecar aula, cancelar aula, status, fim
