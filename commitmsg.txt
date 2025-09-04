@@ -1,7 +1,4 @@
-﻿feat(educacional): fluxo de aula com múltipla escolha (5x Matemática + 1x Português) e comando 'começar aula'
+﻿fix(server): corrige anotação de tipo em _get_or_create_user (']' ausente)
 
-- Adiciona sessão de aula (user['lesson']) com MCQ simples (responder 1..4)
-- Comandos: começar/comecar/iniciar aula, cancelar aula; continua de onde parou
-- Ao finalizar: resumo de acertos e mark_day_done() (notifica responsáveis)
-- Mantém onboarding guiado e check-in diário (+3h do lembrete)
-- Mensagem WELCOME atualizada para expor o comando 'começar aula'
+- Ajusta retorno para Tuple[str, Dict[str, Any]]
+- Evita SyntaxError no import do módulo no Railway
