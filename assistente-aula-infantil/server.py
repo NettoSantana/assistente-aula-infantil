@@ -1,8 +1,9 @@
 # assistente-aula-infantil/server.py
-# Assistente Educacional — Onboarding guiado + Check-in diário (imediato e +3h)
+# Assistente Educacional — Onboarding guiado + Fluxo de Aula (MCQ) + Check-in diário
 # Flask + Twilio. Webhook: POST /bot | Cron: GET /admin/cron
 import os
 import re
+import random
 from typing import Any, Dict, Optional, Tuple, List
 from datetime import datetime, timedelta, time as dtime
 
@@ -92,10 +93,8 @@ def _parse_hhmm_strict(s: str) -> Optional[dtime]:
 def _parse_time_loose(s: str) -> Optional[dtime]:
     """Aceita: 8 -> 08:00 | 19h -> 19:00 | 7 pm -> 19:00 | 18:30"""
     s = (s or "").strip().lower()
-    # 18:30
     t = _parse_hhmm_strict(s)
     if t: return t
-    # 19h / 7pm / 7 pm
     m = re.match(r"^\s*(\d{1,2})\s*(h|pm|am)?\s*$", s)
     if m:
         hh = int(m.group(1))
@@ -121,7 +120,6 @@ def _mask_phone(p: Optional[str]) -> str:
     return f"+{d[:-2]}**{d[-2:]}"
 
 def _parse_phones_list(s: str) -> List[str]:
-    # aceita "71 9xxxx-xxxx, 71 9yyyy-yyyy"
     parts = [p.strip() for p in (s or "").replace(" e ", ",").split(",") if p.strip()]
     out: List[str] = []
     for p in parts:
@@ -178,7 +176,7 @@ def _get_or_create_user(d: Dict[str, Any], sender: str) -> Tuple[str, Dict[str, 
         "profile": {
             "timezone": PROJECT_TZ,
             "child_phone": None,
-            "guardians": [sender],  # já adiciona remetente como responsável
+            "guardians": [sender],  # remetente como responsável
             "child_name": None,
             "child_age": None,
             "grade": None,
@@ -186,6 +184,7 @@ def _get_or_create_user(d: Dict[str, Any], sender: str) -> Tuple[str, Dict[str, 
         "schedule": _default_schedule(),
         "daily_state": {},   # YYYY-MM-DD -> {done, done_ts, done_notified, miss_notified}
         "wizard": None,      # estado do onboarding
+        "lesson": None,      # sessão de aula
     }
     users[key] = user
     return key, user
@@ -279,9 +278,114 @@ def process_checkin_cron(user: Dict[str, Any], now_dt: Optional[datetime] = None
     return "skip:not-due"
 
 # ======================
+# Aula — sessão MCQ MVP
+# ======================
+def _build_math_question() -> Dict[str, Any]:
+    a = random.randint(2, 9)
+    b = random.randint(2, 9)
+    op = random.choice(["+", "-"])
+    if op == "-" and b > a:
+        a, b = b, a
+    correct = a + b if op == "+" else a - b
+    # gera 3 distratores próximos
+    opts = {correct}
+    while len(opts) < 4:
+        delta = random.choice([-3,-2,-1,1,2,3])
+        cand = max(0, correct + delta)
+        opts.add(cand)
+    options = list(opts)
+    random.shuffle(options)
+    answer_idx = options.index(correct)
+    return {
+        "type": "math",
+        "prompt": f"Quanto é {a} {op} {b}?",
+        "options": [str(x) for x in options],
+        "answer": answer_idx  # 0..3
+    }
+
+def _build_pt_question() -> Dict[str, Any]:
+    # Simples: ortografia/acento
+    qs = [
+        ("Qual está escrito corretamente?", ["Exceção", "Excessão", "Eceção", "Ecessão"], 0),
+        ("Qual plural está correto para *pão*?", ["pãos", "pães", "pãoses", "pãeses"], 1),
+        ("Qual forma está correta?", ["A gente vamos", "A gente vai", "Nós vai", "Nós vamos ir"], 1),
+        ("Complete: Ela ___ ao mercado ontem.", ["vai", "foi", "iria", "vou"], 1),
+    ]
+    prompt, options, ans = random.choice(qs)
+    return {
+        "type": "pt",
+        "prompt": prompt,
+        "options": options,
+        "answer": ans
+    }
+
+def _start_lesson(user: Dict[str, Any]) -> str:
+    """Cria sessão do dia: 5 Matemática + 1 Português."""
+    qts: List[Dict[str, Any]] = []
+    for _ in range(max(1, ROUNDS_PER_DAY)):
+        qts.append(_build_math_question())
+    if FEATURE_PORTUGUES:
+        qts.append(_build_pt_question())
+
+    user["lesson"] = {
+        "idx": 0,
+        "q": qts,
+        "hits": 0
+    }
+    return _present_current_question(user)
+
+def _present_current_question(user: Dict[str, Any]) -> str:
+    les = user.get("lesson") or {}
+    idx = int(les.get("idx", 0))
+    qts: List[Dict[str, Any]] = les.get("q") or []
+    if idx >= len(qts):
+        return _finish_lesson(user)
+
+    q = qts[idx]
+    opts = "\n".join([f"{i+1}) {opt}" for i, opt in enumerate(q["options"])])
+    header = "🧮 Matemática" if q["type"] == "math" else "📚 Português"
+    return f"{header}\n{q['prompt']}\nResponda com 1, 2, 3 ou 4:\n{opts}"
+
+def _apply_answer(user: Dict[str, Any], body: str) -> str:
+    les = user.get("lesson") or {}
+    idx = int(les.get("idx", 0))
+    qts: List[Dict[str, Any]] = les.get("q") or []
+    if not qts or idx >= len(qts):
+        return "Não há aula em andamento. Digite *começar aula*."
+
+    m = re.match(r"^\s*([1-4])\s*$", (body or "").strip())
+    if not m:
+        return "Responda apenas com *1*, *2*, *3* ou *4*."
+
+    choice = int(m.group(1)) - 1
+    q = qts[idx]
+    correct_idx = int(q["answer"])
+    if choice == correct_idx:
+        les["hits"] = int(les.get("hits", 0)) + 1
+
+    les["idx"] = idx + 1
+    user["lesson"] = les  # save back
+
+    # Próxima ou fim
+    if les["idx"] >= len(qts):
+        return _finish_lesson(user)
+    return _present_current_question(user)
+
+def _finish_lesson(user: Dict[str, Any]) -> str:
+    les = user.get("lesson") or {}
+    total = len(les.get("q") or [])
+    hits = int(les.get("hits", 0))
+    user["lesson"] = None
+    # Marca dia concluído e notifica responsáveis (idempotente)
+    mark_day_done(user, when=_now())
+    return f"✅ Aula concluída! Acertos: {hits}/{total}.\nQuer ver o *status* do dia?"
+
+# ======================
 # Onboarding (wizard)
 # ======================
-def _start_wizard(user: Dict[str, Any]) -> str:
+GRADES_LIST = GRADES  # alias legível
+
+def _start_wizard(user: Dict[str, Any}) -> str:
     user["wizard"] = {
         "step": "ask_name",
         "tmp": {}
@@ -292,7 +396,7 @@ def _start_wizard(user: Dict[str, Any]) -> str:
             "Pra começar, me diga: *qual é o nome da criança?*")
 
 def _wizard_prompt_grade() -> str:
-    opts = "\n".join([f"{i+1}) {GRADES[i]}" for i in range(len(GRADES))])
+    opts = "\n".join([f"{i+1}) {GRADES_LIST[i]}" for i in range(len(GRADES_LIST))])
     return ("E em qual série/ano ela está?\n"
             "Responda o número ou escreva:\n" + opts)
 
@@ -314,7 +418,6 @@ def _wizard_confirm(user: Dict[str, Any], tmp: Dict[str, Any]) -> str:
     guards = tmp.get("guardians") or (user.get("profile") or {}).get("guardians") or []
     sched = tmp.get("schedule") or user.get("schedule") or {}
 
-    # montar string de horários (mon..sat e sunday se setado)
     parts = []
     for k,pt in SCHEDULE_ORDER:
         v = sched.get(k)
@@ -340,16 +443,14 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
     step = wz.get("step")
     tmp = wz.setdefault("tmp", {})
 
-    # STEP: ask_name
     if step == "ask_name":
         name = body.strip()
         if len(name) < 2:
             return "Digite um nome válido (mín. 2 letras). Qual é o nome da criança?"
         tmp["child_name"] = name
         wz["step"] = "ask_age"
-        return "Perfeito, {0}! 😊\nQuantos anos ela tem?".format(name)
+        return f"Perfeito, {name}! 😊\nQuantos anos ela tem?"
 
-    # STEP: ask_age
     if step == "ask_age":
         m = re.match(r"^\s*(\d{1,2})\s*$", body)
         if not m:
@@ -361,20 +462,18 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
         wz["step"] = "ask_grade"
         return _wizard_prompt_grade()
 
-    # STEP: ask_grade
     if step == "ask_grade":
-        # aceita número 1..N ou texto que case com GRADES
         n = re.match(r"^\s*(\d{1,2})\s*$", body)
         if n:
             idx = int(n.group(1)) - 1
-            if 0 <= idx < len(GRADES):
-                tmp["grade"] = GRADES[idx]
+            if 0 <= idx < len(GRADES_LIST):
+                tmp["grade"] = GRADES_LIST[idx]
             else:
                 return _wizard_prompt_grade()
         else:
             txt = body.strip().lower()
             chosen = None
-            for g in GRADES:
+            for g in GRADES_LIST:
                 if txt in g.lower():
                     chosen = g
                     break
@@ -385,7 +484,6 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
         return ("Matheus tem um número próprio de WhatsApp?\n"
                 "Envie no formato +55 DDD XXXXX-XXXX ou responda *não tem*.")
 
-    # STEP: ask_child_whatsapp
     if step == "ask_child_whatsapp":
         b = body.strip().lower()
         if "não tem" in b or "nao tem" in b or b in ("nao", "não", "n"):
@@ -400,31 +498,25 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
         return ("Agora, o(s) número(s) do(s) responsável(is) (1 ou 2), separados por vírgula.\n"
                 "Ex.: +55 71 98888-7777, +55 71 97777-8888")
 
-    # STEP: ask_guardians
     if step == "ask_guardians":
         gs = _parse_phones_list(body)
-        # garante que o remetente permaneça cadastrado
         sender = (user.get("profile") or {}).get("guardians", [])[0]
-        if sender and _digits_only(sender) not in [ _digits_only(x) for x in gs ]:
+        if sender and _digits_only(sender) not in [_digits_only(x) for x in gs]:
             gs = [sender] + gs
-        tmp["guardians"] = list(dict.fromkeys(gs))[:2]  # únicos, até 2
+        tmp["guardians"] = list(dict.fromkeys(gs))[:2]
         wz["step"] = "ask_sunday"
         return _wizard_prompt_yesno_domingo()
 
-    # STEP: ask_sunday
     if step == "ask_sunday":
         yn = _yes_no(body)
         if yn is None:
             return _wizard_prompt_yesno_domingo()
         tmp.setdefault("schedule", _default_schedule())
         tmp["schedule"]["sun"] = tmp["schedule"]["sun"] if yn else None
-        # preparar perguntas de seg–sáb
         wz["step"] = "ask_time_mon"
         return _wizard_prompt_time_for("seg")
 
-    # Horários: mon..sat
     def _handle_time_for(day_key: str, day_pt: str, next_step: str) -> str:
-        # múltipla escolha simples
         s = body.strip()
         choice = re.match(r"^\s*([1-5])\s*$", s)
         if choice:
@@ -447,7 +539,6 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
         if next_step == "ask_time_thu":  return _wizard_prompt_time_for("qui")
         if next_step == "ask_time_fri":  return _wizard_prompt_time_for("sex")
         if next_step == "ask_time_sat":  return _wizard_prompt_time_for("sáb")
-        # confirmação
         return _wizard_confirm(user, tmp)
 
     if step == "ask_time_mon": return _handle_time_for("mon","seg","ask_time_tue")
@@ -457,16 +548,13 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
     if step == "ask_time_fri": return _handle_time_for("fri","sex","ask_time_sat")
     if step == "ask_time_sat": return _handle_time_for("sat","sáb","confirm")
 
-    # STEP: confirm
     if step == "confirm":
         yn = _yes_no(body)
         if yn is None:
             return _wizard_confirm(user, tmp)
         if not yn:
-            # recomeçar o cadastro de forma simples
             user["wizard"] = None
             return _start_wizard(user)
-        # salvar definitivo
         prof = user.setdefault("profile", {})
         prof["child_name"] = tmp.get("child_name")
         prof["child_age"] = tmp.get("child_age")
@@ -474,7 +562,6 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
         prof["child_phone"] = tmp.get("child_phone")
         if tmp.get("guardians"):
             prof["guardians"] = tmp["guardians"]
-        # horários
         if tmp.get("schedule"):
             user["schedule"] = tmp["schedule"]
         user["wizard"] = None
@@ -489,7 +576,8 @@ WELCOME = (
     "Olá! Eu sou a MARIA ANGELA 👋\n"
     "Posso acompanhar as atividades diárias de Matemática e Português"
     f"{' e Leitura' if FEATURE_LEITURA else ''}.\n\n"
-    "Digite *iniciar* para configurar, *status* para ver o dia, ou *fim* para marcar o dia como concluído (teste)."
+    "Digite *iniciar* para configurar, *começar aula* para iniciar atividades, "
+    "ou *status* para ver o dia. Para teste, *fim* marca o dia como concluído."
 )
 
 def _status_text(user: Dict[str, Any]) -> str:
@@ -498,13 +586,13 @@ def _status_text(user: Dict[str, Any]) -> str:
     st = _get_day_state(user, day_key)
     rem_dt = _get_today_reminder_dt(user, base_dt=now_dt)
     rem = rem_dt.strftime("%H:%M") if rem_dt else "—"
-    sch = user.get("schedule") or {}
-    week = _weekday_key(now_dt)
-    dia = dict(SCHEDULE_ORDER)[week]
+    dia = dict(SCHEDULE_ORDER)[_weekday_key(now_dt)]
+    in_lesson = "sim" if user.get("lesson") else "não"
     return (
         f"📊 Status {day_key}\n"
         f"- Feito: {'sim' if st['done'] else 'não'}\n"
         f"- Lembrete de hoje ({dia}): {rem}\n"
+        f"- Aula em andamento: {in_lesson}\n"
         f"- Notif. feito: {'sim' if st.get('done_notified') else 'não'}\n"
         f"- Notif. falta: {'sim' if st.get('miss_notified') else 'não'}"
     )
@@ -523,10 +611,9 @@ def bot() -> Response:
 
     resp = MessagingResponse()
     msg = resp.message()
-
     lower = body.lower()
 
-    # Comandos de atalho
+    # Comandos de atalho (admin/fluxo)
     if lower in ("reiniciar cadastro", "reset cadastro", "recomeçar cadastro", "recomecar cadastro"):
         user["wizard"] = None
         _save(d)
@@ -534,7 +621,6 @@ def bot() -> Response:
         return Response(str(resp), mimetype="application/xml")
 
     if lower in ("iniciar", "start"):
-        # Abre o wizard — onboarding passo-a-passo
         msg.body(_start_wizard(user))
         _save(d)
         return Response(str(resp), mimetype="application/xml")
@@ -550,7 +636,13 @@ def bot() -> Response:
         msg.body("✅ Dia marcado como concluído. Aviso enviado aos responsáveis.")
         return Response(str(resp), mimetype="application/xml")
 
-    # Se estiver no wizard, trata primeiro
+    if lower in ("cancelar aula", "cancelar", "parar aula"):
+        user["lesson"] = None
+        _save(d)
+        msg.body("Aula cancelada. Quando quiser retomar, envie *começar aula*.")
+        return Response(str(resp), mimetype="application/xml")
+
+    # Wizard de cadastro tem prioridade
     if user.get("wizard"):
         out = _handle_wizard(user, body)
         if out:
@@ -558,8 +650,23 @@ def bot() -> Response:
             _save(d)
             return Response(str(resp), mimetype="application/xml")
 
-    # Aqui entraria seu fluxo real (MAT → PT → [LEITURA]).
-    # Ao finalizar o pipeline do dia, chame mark_day_done(user) e _save(d).
+    # Iniciar aula
+    if lower in ("começar aula", "comecar aula", "iniciar aula", "aula"):
+        # Se já tiver uma em andamento, continua
+        if user.get("lesson"):
+            msg.body(_present_current_question(user))
+        else:
+            msg.body(_start_lesson(user))
+        _save(d)
+        return Response(str(resp), mimetype="application/xml")
+
+    # Resposta de aula em andamento (1..4)
+    if user.get("lesson"):
+        msg.body(_apply_answer(user, body))
+        _save(d)
+        return Response(str(resp), mimetype="application/xml")
+
+    # Default
     msg.body(WELCOME)
     _save(d)
     return Response(str(resp), mimetype="application/xml")
