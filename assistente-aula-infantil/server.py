@@ -160,7 +160,7 @@ SCHEDULE_ORDER = [("mon","seg"),("tue","ter"),("wed","qua"),("thu","qui"),("fri"
 def _default_schedule() -> Dict[str, Optional[str]]:
     return {k: ("19:00" if k != "sun" else None) for k,_ in SCHEDULE_ORDER}
 
-def _get_or_create_user(d: Dict[str, Any], sender: str) -> Tuple[str, Dict[str, Any]]:
+def _get_or_create_user(d: Dict[str, Any], sender: str) -> Tuple[str, Dict[str, Any]):
     key = _digits_only(sender)
     users = d["users"]
     if key in users:
@@ -233,7 +233,7 @@ def _get_day_state(user: Dict[str, Any], day_key: str) -> Dict[str, Any]:
     st.setdefault("miss_notified", False)
     return st
 
-def mark_day_done(user: Dict[str, Any], when: Optional[datetime] = None) -> Tuple[str, Dict[str, Any]]:
+def mark_day_done(user: Dict[str, Any], when: Optional[datetime] = None) -> Tuple[str, Dict[str, Any]):
     when = when or _now()
     day_key = _today_str(when)
     st = _get_day_state(user, day_key)
@@ -321,7 +321,7 @@ def _build_pt_question() -> Dict[str, Any]:
 
 def _start_lesson(user: Dict[str, Any]) -> str:
     """Cria sessão do dia: 5 Matemática + 1 Português."""
-    qts: List[Dict[str, Any]] = []
+    qts: List[Dict[str, Any]) = []
     for _ in range(max(1, ROUNDS_PER_DAY)):
         qts.append(_build_math_question())
     if FEATURE_PORTUGUES:
@@ -337,7 +337,7 @@ def _start_lesson(user: Dict[str, Any]) -> str:
 def _present_current_question(user: Dict[str, Any]) -> str:
     les = user.get("lesson") or {}
     idx = int(les.get("idx", 0))
-    qts: List[Dict[str, Any]] = les.get("q") or []
+    qts: List[Dict[str, Any]) = les.get("q") or []
     if idx >= len(qts):
         return _finish_lesson(user)
 
@@ -349,7 +349,7 @@ def _present_current_question(user: Dict[str, Any]) -> str:
 def _apply_answer(user: Dict[str, Any], body: str) -> str:
     les = user.get("lesson") or {}
     idx = int(les.get("idx", 0))
-    qts: List[Dict[str, Any]] = les.get("q") or []
+    qts: List[Dict[str, Any]) = les.get("q") or []
     if not qts or idx >= len(qts):
         return "Não há aula em andamento. Digite *começar aula*."
 
@@ -385,7 +385,7 @@ def _finish_lesson(user: Dict[str, Any]) -> str:
 # ======================
 GRADES_LIST = GRADES  # alias legível
 
-def _start_wizard(user: Dict[str, Any}) -> str:
+def _start_wizard(user: Dict[str, Any])) -> str:
     user["wizard"] = {
         "step": "ask_name",
         "tmp": {}
