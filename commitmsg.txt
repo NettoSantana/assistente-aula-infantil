@@ -1,7 +1,7 @@
-﻿feat(educacional): onboarding guiado com múltipla escolha simples + mantém check-in diário
+﻿feat(educacional): fluxo de aula com múltipla escolha (5x Matemática + 1x Português) e comando 'começar aula'
 
-- Restaura fluxo antigo (nome, idade, série, telefones, domingo?, horários seg–sáb, confirmação)
-- Múltipla escolha: números 1..N ou texto; horários com presets e “outro”
-- Corrige bug do iniciar que apenas repetia WELCOME (agora abre wizard)
-- Mantém check-in diário com aviso imediato e falta +3h
-- Comandos: iniciar, status, fim, reiniciar cadastro
+- Adiciona sessão de aula (user['lesson']) com MCQ simples (responder 1..4)
+- Comandos: começar/comecar/iniciar aula, cancelar aula; continua de onde parou
+- Ao finalizar: resumo de acertos e mark_day_done() (notifica responsáveis)
+- Mantém onboarding guiado e check-in diário (+3h do lembrete)
+- Mensagem WELCOME atualizada para expor o comando 'começar aula'
