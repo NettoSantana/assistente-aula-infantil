@@ -1,6 +1,7 @@
-﻿fix(phone-index): unificar UIDs duplicados automaticamente no webhook
+﻿feat(educacional): onboarding guiado com múltipla escolha simples + mantém check-in diário
 
-- Resolve UID canônico pelo número recebido
-- Merge de contas-espelho (phone_index + perfis) → UID estável
-- Remapeia todos os números para o UID canônico
-- #resetar agora usa a mesma estratégia de unificação antes de zerar
+- Restaura fluxo antigo (nome, idade, série, telefones, domingo?, horários seg–sáb, confirmação)
+- Múltipla escolha: números 1..N ou texto; horários com presets e “outro”
+- Corrige bug do iniciar que apenas repetia WELCOME (agora abre wizard)
+- Mantém check-in diário com aviso imediato e falta +3h
+- Comandos: iniciar, status, fim, reiniciar cadastro
