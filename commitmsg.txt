@@ -1,4 +1,7 @@
-﻿fix(server): corrige anotação de tipo em _get_or_create_user (']' ausente)
+﻿fix(server): corrigir colchetes/chaves e finalizar fluxo de aula + check-in
 
-- Ajusta retorno para Tuple[str, Dict[str, Any]]
-- Evita SyntaxError no import do módulo no Railway
+- Corrige todas as anotações de tipo (Tuple[...] / Dict[...]) e parênteses
+- Onboarding guiado (múltipla escolha simples) restaurado
+- Fluxo de aula (5x Mat + 1x PT) com MCQ e mark_day_done() ao final
+- Check-in diário: aviso imediato e falta +3h do lembrete
+- Comandos: iniciar, começar/comecar aula, cancelar aula, status, fim
