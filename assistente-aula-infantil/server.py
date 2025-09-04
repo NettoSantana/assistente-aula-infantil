@@ -1,6 +1,7 @@
 # assistente-aula-infantil/server.py
 # Assistente Educacional — Onboarding guiado + Fluxo de Aula (MCQ) + Check-in diário
-# Flask + Twilio. Webhook: POST /bot | Cron: GET /admin/cron
+# + 5 rodadas de matemática (soma, subtração, multiplicação, divisão, mistura)
+# + comando #resetar e atalho "ok" no onboarding
 import os
 import re
 import random
@@ -134,6 +135,11 @@ def _yes_no(body: str) -> Optional[bool]:
     if b in ("2", "n", "nao", "não", "no"): return False
     return None
 
+def _is_ok(body: str) -> bool:
+    """Atalho de confirmação/avanço."""
+    b = (body or "").strip().lower()
+    return b in ("ok", "ok!", "ok.", "okay", "okey", "👍", "✅")
+
 # ===========================
 # DB layout e acesso a usuário
 # ===========================
@@ -164,7 +170,7 @@ def _default_schedule() -> Dict[str, Optional[str]]:
 
 def _get_or_create_user(d: Dict[str, Any], sender: str) -> Tuple[str, Dict[str, Any]]:
     key = _digits_only(sender)
-    users: Dict[str, Dict[str, Any]] = d["users"]  # tipo explícito
+    users: Dict[str, Dict[str, Any]] = d["users"]
     if key in users:
         return key, users[key]
     for k, user in users.items():
@@ -280,48 +286,72 @@ def process_checkin_cron(user: Dict[str, Any], now_dt: Optional[datetime] = None
     return "skip:not-due"
 
 # ======================
-# Aula — sessão MCQ MVP
+# Aula — sessão MCQ (5 rodadas fixas)
 # ======================
-def _build_math_question() -> Dict[str, Any]:
-    a = random.randint(2, 9)
-    b = random.randint(2, 9)
-    op = random.choice(["+", "-"])
-    if op == "-" and b > a:
-        a, b = b, a
-    correct = a + b if op == "+" else a - b
-    # 3 distratores
+def _build_math_question(op: Optional[str] = None) -> Dict[str, Any]:
+    """Gera 1 questão de acordo com a operação: '+', '-', '*', '/', 'mix'."""
+    if op == "mix" or op is None:
+        op = random.choice(["+", "-", "*", "/"])
+
+    if op == "+":
+        a, b = random.randint(2, 9), random.randint(2, 9)
+        correct = a + b
+        prompt = f"Quanto é {a} + {b}?"
+        corpus = list(range(max(0, correct - 4), correct + 5))
+        corpus = [x for x in corpus if x >= 0]
+    elif op == "-":
+        a, b = random.randint(2, 9), random.randint(2, 9)
+        if b > a: a, b = b, a
+        correct = a - b
+        prompt = f"Quanto é {a} - {b}?"
+        corpus = list(range(max(0, correct - 4), correct + 5))
+    elif op == "*":
+        a, b = random.randint(2, 9), random.randint(2, 9)
+        correct = a * b
+        prompt = f"Quanto é {a} × {b}?"
+        # distratores próximos de tabuada
+        corpus = [correct + d for d in (-6,-4,-3,-2,-1,1,2,3,4,6) if correct + d > 0]
+    elif op == "/":
+        # garante divisão exata: (q * b) ÷ b = q
+        b = random.randint(2, 9)
+        q = random.randint(2, 9)
+        a = b * q
+        correct = q
+        prompt = f"Quanto é {a} ÷ {b}?"
+        corpus = [max(1, correct + d) for d in (-3,-2,-1,1,2,3)]
+    else:
+        # fallback
+        a, b = 2, 2
+        correct = 4
+        prompt = "Quanto é 2 + 2?"
+        corpus = [1,2,3,4,5,6]
+
+    # monta opções (4) com correta + 3 distratores
     opts = {correct}
-    while len(opts) < 4:
-        delta = random.choice([-3,-2,-1,1,2,3])
-        cand = max(0, correct + delta)
-        opts.add(cand)
+    random.shuffle(corpus)
+    for v in corpus:
+        if len(opts) >= 4: break
+        if v != correct: opts.add(v)
     options = list(opts)
     random.shuffle(options)
     answer_idx = options.index(correct)
+
     return {
         "type": "math",
-        "prompt": f"Quanto é {a} {op} {b}?",
+        "op": op,
+        "prompt": prompt,
         "options": [str(x) for x in options],
         "answer": answer_idx  # 0..3
     }
 
-def _build_pt_question() -> Dict[str, Any]:
-    qs = [
-        ("Qual está escrito corretamente?", ["Exceção", "Excessão", "Eceção", "Ecessão"], 0),
-        ("Qual plural está correto para *pão*?", ["pãos", "pães", "pãoses", "pãeses"], 1),
-        ("Qual forma está correta?", ["A gente vamos", "A gente vai", "Nós vai", "Nós vamos ir"], 1),
-        ("Complete: Ela ___ ao mercado ontem.", ["vai", "foi", "iria", "vou"], 1),
-    ]
-    prompt, options, ans = random.choice(qs)
-    return {"type": "pt", "prompt": prompt, "options": options, "answer": ans}
-
 def _start_lesson(user: Dict[str, Any]) -> str:
-    """Cria sessão do dia: 5 Matemática + 1 Português (se habilitado)."""
-    qts: List[Dict[str, Any]] = []
-    for _ in range(max(1, ROUNDS_PER_DAY)):
-        qts.append(_build_math_question())
-    if FEATURE_PORTUGUES:
-        qts.append(_build_pt_question())
+    """Cria sessão do dia com 5 rodadas fixas:
+       soma → subtração → multiplicação → divisão → mistura.
+    """
+    ops_order = ["+", "-", "*", "/", "mix"]
+    qts: List[Dict[str, Any]] = [ _build_math_question(op) for op in ops_order ]
+    # Se quiser manter Português depois das 5, habilite a linha abaixo:
+    # if FEATURE_PORTUGUES: qts.append(_build_pt_question())
     user["lesson"] = {"idx": 0, "q": qts, "hits": 0}
     return _present_current_question(user)
 
@@ -333,7 +363,7 @@ def _present_current_question(user: Dict[str, Any]) -> str:
         return _finish_lesson(user)
     q = qts[idx]
     opts = "\n".join([f"{i+1}) {opt}" for i, opt in enumerate(q["options"])])
-    header = "🧮 Matemática" if q["type"] == "math" else "📚 Português"
+    header = "🧮 Matemática"
     return f"{header}\n{q['prompt']}\nResponda com 1, 2, 3 ou 4:\n{opts}"
 
 def _apply_answer(user: Dict[str, Any], body: str) -> str:
@@ -365,7 +395,20 @@ def _finish_lesson(user: Dict[str, Any]) -> str:
     return f"✅ Aula concluída! Acertos: {hits}/{total}.\nQuer ver o *status* do dia?"
 
 # ======================
-# Onboarding (wizard)
+# Português (opcional — mantido para futuro)
+# ======================
+def _build_pt_question() -> Dict[str, Any]:
+    qs = [
+        ("Qual está escrito corretamente?", ["Exceção", "Excessão", "Eceção", "Ecessão"], 0),
+        ("Qual plural está correto para *pão*?", ["pãos", "pães", "pãoses", "pãeses"], 1),
+        ("Qual forma está correta?", ["A gente vamos", "A gente vai", "Nós vai", "Nós vamos ir"], 1),
+        ("Complete: Ela ___ ao mercado ontem.", ["vai", "foi", "iria", "vou"], 1),
+    ]
+    prompt, options, ans = random.choice(qs)
+    return {"type": "pt", "prompt": prompt, "options": options, "answer": ans}
+
+# ======================
+# Onboarding (wizard) — com atalho "ok"
 # ======================
 def _start_wizard(user: Dict[str, Any]) -> str:
     user["wizard"] = {"step": "ask_name", "tmp": {}}
@@ -384,12 +427,12 @@ def _wizard_prompt_grade() -> str:
 def _wizard_prompt_yesno_domingo() -> str:
     return ("Perfeito! 📅 A rotina é segunda a sábado por padrão.\n"
             "Deseja incluir domingo também?\n"
-            "1) sim   2) não")
+            "1) sim   2) não   (ou responda *ok* para 'não')")
 
 def _wizard_prompt_time_for(day_pt: str) -> str:
     return (f"Qual horário para *{day_pt}*? (faixa 05:00–21:30)\n"
             "Responda o número ou o horário:\n"
-            "1) 08:00   2) 18:30   3) 19:00   4) 20:00   5) outro")
+            "1) 08:00   2) 18:30   3) 19:00   4) 20:00   5) outro   (ou *ok* para 19:00)")
 
 def _wizard_confirm(user: Dict[str, Any], tmp: Dict[str, Any]) -> str:
     child = tmp.get("child_name") or (user.get("profile") or {}).get("child_name") or "—"
@@ -412,7 +455,7 @@ def _wizard_confirm(user: Dict[str, Any], tmp: Dict[str, Any]) -> str:
         f"* WhatsApp da criança: {_mask_phone(cphone)}\n"
         f"* Responsável(is): {', '.join(_mask_phone(g) for g in guards) or '—'}\n"
         f"* Rotina: {rotina}\n"
-        "Responda *sim* para salvar, ou *não* para ajustar."
+        "Responda *sim* para salvar, ou *não* para ajustar. (ou *ok* para salvar)"
     )
 
 def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
@@ -461,11 +504,11 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
             tmp["grade"] = chosen
         wz["step"] = "ask_child_whatsapp"
         return ("A criança tem um número próprio de WhatsApp?\n"
-                "Envie no formato +55 DDD XXXXX-XXXX ou responda *não tem*.")
+                "Envie no formato +55 DDD XXXXX-XXXX ou responda *não tem* (ou *ok* para 'não tem').")
 
     if step == "ask_child_whatsapp":
         b = body.strip().lower()
-        if "não tem" in b or "nao tem" in b or b in ("nao", "não", "n"):
+        if _is_ok(b) or "não tem" in b or "nao tem" in b or b in ("nao", "não", "n"):
             tmp["child_phone"] = None
         else:
             d = _digits_only(body)
@@ -475,21 +518,29 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
             tmp["child_phone"] = d
         wz["step"] = "ask_guardians"
         return ("Agora, o(s) número(s) do(s) responsável(is) (1 ou 2), separados por vírgula.\n"
-                "Ex.: +55 71 98888-7777, +55 71 97777-8888")
+                "Ex.: +55 71 98888-7777, +55 71 97777-8888\n"
+                "(ou responda *ok* para manter só o seu número)")
 
     if step == "ask_guardians":
-        gs = _parse_phones_list(body)
-        sender = (user.get("profile") or {}).get("guardians", [])[0]
-        if sender and _digits_only(sender) not in [_digits_only(x) for x in gs]:
-            gs = [sender] + gs
-        tmp["guardians"] = list(dict.fromkeys(gs))[:2]
+        if _is_ok(body):
+            sender = (user.get("profile") or {}).get("guardians", [None])[0]
+            tmp["guardians"] = [g for g in [sender] if g]
+        else:
+            gs = _parse_phones_list(body)
+            sender = (user.get("profile") or {}).get("guardians", [])[0]
+            if sender and _digits_only(sender) not in [_digits_only(x) for x in gs]:
+                gs = [sender] + gs
+            tmp["guardians"] = list(dict.fromkeys(gs))[:2]
         wz["step"] = "ask_sunday"
         return _wizard_prompt_yesno_domingo()
 
     if step == "ask_sunday":
-        yn = _yes_no(body)
-        if yn is None:
-            return _wizard_prompt_yesno_domingo()
+        if _is_ok(body):
+            yn = False
+        else:
+            yn = _yes_no(body)
+            if yn is None:
+                return _wizard_prompt_yesno_domingo()
         tmp.setdefault("schedule", _default_schedule())
         tmp["schedule"]["sun"] = tmp["schedule"]["sun"] if yn else None
         wz["step"] = "ask_time_mon"
@@ -497,19 +548,22 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
 
     def _handle_time_for(day_key: str, day_pt: str, next_step: str) -> str:
         s = body.strip()
-        choice = re.match(r"^\s*([1-5])\s*$", s)
-        if choice:
-            c = int(choice.group(1))
-            mapping = {1:"08:00", 2:"18:30", 3:"19:00", 4:"20:00"}
-            if c in (1,2,3,4):
-                val = mapping[c]
-                t = _parse_hhmm_strict(val)
-            else:
-                return "Digite o horário desejado (ex.: 18:30, 19h, 7 pm)."
+        if _is_ok(s):
+            t = _parse_hhmm_strict("19:00")
         else:
-            t = _parse_hhmm_strict(s) or _parse_time_loose(s)
-            if not t:
-                return _wizard_prompt_time_for(day_pt)
+            choice = re.match(r"^\s*([1-5])\s*$", s)
+            if choice:
+                c = int(choice.group(1))
+                mapping = {1:"08:00", 2:"18:30", 3:"19:00", 4:"20:00"}
+                if c in (1,2,3,4):
+                    val = mapping[c]
+                    t = _parse_hhmm_strict(val)
+                else:
+                    return "Digite o horário desejado (ex.: 18:30, 19h, 7 pm)."
+            else:
+                t = _parse_hhmm_strict(s) or _parse_time_loose(s)
+                if not t:
+                    return _wizard_prompt_time_for(day_pt)
         tmp.setdefault("schedule", _default_schedule())
         tmp["schedule"][day_key] = f"{t.hour:02d}:{t.minute:02d}"
         wz["step"] = next_step
@@ -528,9 +582,13 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
     if step == "ask_time_sat": return _handle_time_for("sat","sáb","confirm")
 
     if step == "confirm":
-        yn = _yes_no(body)
-        if yn is None:
-            return _wizard_confirm(user, tmp)
+        yn: Optional[bool]
+        if _is_ok(body):
+            yn = True
+        else:
+            yn = _yes_no(body)
+            if yn is None:
+                return _wizard_confirm(user, tmp)
         if not yn:
             user["wizard"] = None
             return _start_wizard(user)
@@ -556,7 +614,8 @@ WELCOME = (
     "Posso acompanhar as atividades diárias de Matemática e Português"
     f"{' e Leitura' if FEATURE_LEITURA else ''}.\n\n"
     "Digite *iniciar* para configurar, *começar aula* para iniciar atividades, "
-    "ou *status* para ver o dia. Para teste, *fim* marca o dia como concluído."
+    "*status* para ver o dia. Para teste, *fim* marca o dia como concluído.\n"
+    "Atalhos dev: *ok* (avançar no cadastro), *#resetar* (zerar tudo)."
 )
 
 def _status_text(user: Dict[str, Any]) -> str:
@@ -594,6 +653,13 @@ def bot() -> Response:
     lower = body.lower()
 
     # Comandos de atalho (admin/fluxo)
+    if lower in ("#resetar", "resetar", "#reset", "reset"):
+        # apaga usuário e volta pro começo
+        d["users"].pop(user_key, None)
+        _save(d)
+        msg.body("🔄 Tudo zerado. Digite *iniciar* para começar do zero.")
+        return Response(str(resp), mimetype="application/xml")
+
     if lower in ("reiniciar cadastro", "reset cadastro", "recomeçar cadastro", "recomecar cadastro"):
         user["wizard"] = None
         _save(d)
@@ -631,7 +697,7 @@ def bot() -> Response:
             return Response(str(resp), mimetype="application/xml")
 
     # Iniciar/continuar aula
-    if lower in ("começar aula", "comecar aula", "iniciar aula", "aula"):
+    if lower in ("começar aula", "comecar aula", "iniciar aula", "aula", "começar"):
         if user.get("lesson"):
             msg.body(_present_current_question(user))
         else:
