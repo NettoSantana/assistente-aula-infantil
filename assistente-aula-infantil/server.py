@@ -1,7 +1,7 @@
-# assistente-aula-infantil/server.py
-# Assistente Educacional — Onboarding guiado + Fluxo de Aula (MCQ) + Check-in diário
-# 5 rodadas de matemática (+, -, ×, ÷, mix), #resetar, atalho "ok"
-# AGORA: alternativas a–d, 2 re-tentativas + dica na 3ª, menu por múltipla escolha (a=iniciar, b=status, c=começar, d=#resetar)
+# PATH: assistente-aula-infantil/server.py
+# LAST_RECODE: 2026-01-29 22:30 America/Bahia
+# MOTIVO: Encadear Portugues automaticamente apos Matematica; remover emojis de mensagens; padronizar feedback de erro.
+
 import os
 import re
 import random
@@ -118,7 +118,7 @@ def _yes_no(body: str) -> Optional[bool]:
     return None
 
 def _is_ok(body: str) -> bool:
-    return (body or "").strip().lower() in ("ok","ok!","ok.","okay","okey","👍","✅")
+    return (body or "").strip().lower() in ("ok","ok!","ok.","okay","okey","","")
 
 def _choice_to_index(body: str) -> Optional[int]:
     """Converte a/b/c/d (ou 1-4) em índice 0..3."""
@@ -202,13 +202,13 @@ def _send_whatsapp(to_number: str, body: str) -> None:
 
 def _notify_done(user: Dict[str, Any], day_key: str, late: bool = False) -> None:
     name = ((user.get("profile") or {}).get("child_name") or "A criança")
-    msg = f"✅ {name} concluiu{' agora' if late else ''} as atividades de hoje. Bom trabalho!"
+    msg = f" {name} concluiu{' agora' if late else ''} as atividades de hoje. Bom trabalho!"
     for g in (user.get("profile") or {}).get("guardians", []) or []:
         _send_whatsapp(g, msg)
 
 def _notify_miss(user: Dict[str, Any], day_key: str) -> None:
     name = ((user.get("profile") or {}).get("child_name") or "A criança")
-    msg = f"⚠️ {name} ainda não concluiu as atividades de hoje. Precisa de ajuda para finalizar?"
+    msg = f" {name} ainda não concluiu as atividades de hoje. Precisa de ajuda para finalizar?"
     for g in (user.get("profile") or {}).get("guardians", []) or []:
         _send_whatsapp(g, msg)
 
@@ -331,8 +331,16 @@ def _build_math_question(op: Optional[str] = None) -> Dict[str, Any]:
     }
 
 def _start_lesson(user: Dict[str, Any]) -> str:
+    # Sessao do dia:
+    # 1) Matematica: 5 rodadas fixas (soma, subtracao, multiplicacao, divisao, mistura)
+    # 2) Portugues: PT_ROUNDS_PER_DAY rodadas (se FEATURE_PORTUGUES=True)
     ops_order = ["+", "-", "*", "/", "mix"]
     qts: List[Dict[str, Any]] = [_build_math_question(op) for op in ops_order]
+
+    if FEATURE_PORTUGUES:
+        for _ in range(max(1, PT_ROUNDS_PER_DAY)):
+            qts.append(_build_pt_question())
+
     user["lesson"] = {"idx": 0, "q": qts, "hits": 0, "tries": {}}
     return _present_current_question(user)
 
@@ -342,45 +350,63 @@ def _present_current_question(user: Dict[str, Any]) -> str:
     qts: List[Dict[str, Any]] = les.get("q") or []
     if idx >= len(qts):
         return _finish_lesson(user)
+
     q = qts[idx]
     tries = int((les.get("tries") or {}).get(idx, 0))
-    hint = f"\n💡 Dica: {_hint_for(q)}" if tries >= 2 else ""
+
+    if q.get("type") == "pt":
+        header = "PORTUGUES"
+        hint = ""
+    else:
+        header = "MATEMATICA"
+        hint = f"
+Dica: {_hint_for(q)}" if tries >= 2 else ""
+
     opts = _options_with_letters(q["options"])
-    header = "🧮 Matemática"
-    return f"{header}\n{q['prompt']}{hint}\nResponda com a, b, c ou d:\n{opts}"
+    return f"{header}
+{q['prompt']}{hint}
+Responda com a, b, c ou d:
+{opts}"
 
 def _apply_answer(user: Dict[str, Any], body: str) -> str:
     les = user.get("lesson") or {}
     idx = int(les.get("idx", 0))
     qts: List[Dict[str, Any]] = les.get("q") or []
     if not qts or idx >= len(qts):
-        return "Não há aula em andamento. Digite *começar aula*."
+        return "Nao ha aula em andamento. Digite comecar aula."
+
     choice = _choice_to_index(body)
     if choice is None:
-        return "Responda apenas com *a*, *b*, *c* ou *d*."
+        return "Responda apenas com a, b, c ou d."
+
     q = qts[idx]
     correct_idx = int(q["answer"])
+
+    # acertou
     if choice == correct_idx:
         les["hits"] = int(les.get("hits", 0)) + 1
-        (les.get("tries") or {}).pop(idx, None)
+        tries_map: Dict[int, int] = les.setdefault("tries", {})
+        tries_map.pop(idx, None)
         les["idx"] = idx + 1
         user["lesson"] = les
         return _present_current_question(user)
-    # errado
-    tries_map: Dict[int, int] = les.setdefault("tries", {})
-    t = tries_map.get(idx, 0) + 1
-    tries_map[idx] = t
+
+    # errou
+    tries_map2: Dict[int, int] = les.setdefault("tries", {})
+    t = int(tries_map2.get(idx, 0)) + 1
+    tries_map2[idx] = t
     user["lesson"] = les
+
+    # 3a tentativa: mostra correta e segue
     if t >= 3:
-        # errou até a 3ª -> mostra correta e segue
-        letters = ["a","b","c","d"]
+        letters = ["a", "b", "c", "d"]
         correct_val = q["options"][correct_idx]
         les["idx"] = idx + 1
-        tries_map.pop(idx, None)
+        tries_map2.pop(idx, None)
         user["lesson"] = les
-        return f"❌ Não foi dessa vez. A correta era **{letters[correct_idx]} ({correct_val})**.\n" + _present_current_question(user)
-    # re-apresenta (na 3ª tentativa a dica já aparece em _present_current_question)
-    return "❌ Tente novamente.\n" + _present_current_question(user)
+        return f"Nao foi dessa vez. A correta era {letters[correct_idx]}) {correct_val}.\n" + _present_current_question(user)
+
+    return "Tente novamente.\n" + _present_current_question(user)
 
 def _finish_lesson(user: Dict[str, Any]) -> str:
     les = user.get("lesson") or {}
@@ -388,7 +414,7 @@ def _finish_lesson(user: Dict[str, Any]) -> str:
     hits = int(les.get("hits", 0))
     user["lesson"] = None
     mark_day_done(user, when=_now())
-    return f"✅ Aula concluída! Acertos: {hits}/{total}.\nQuer ver o *status* do dia?"
+    return f" Aula concluída! Acertos: {hits}/{total}.\nQuer ver o *status* do dia?"
 
 # ======================
 # Português (mantido para futuro)
@@ -409,7 +435,7 @@ def _build_pt_question() -> Dict[str, Any]:
 def _start_wizard(user: Dict[str, Any]) -> str:
     user["wizard"] = {"step": "ask_name", "tmp": {}}
     return (
-        "Oi! Eu sou a MARIA ANGELA 🌟 sua assistente de aula.\n"
+        "Oi! Eu sou a MARIA ANGELA  sua assistente de aula.\n"
         "Vou te acompanhar em atividades de Matemática, Português"
         f"{' e Leitura' if FEATURE_LEITURA else ''}.\n\n"
         "Pra começar, me diga: *qual é o nome da criança?*"
@@ -421,7 +447,7 @@ def _wizard_prompt_grade() -> str:
             "Responda o número ou escreva:\n" + opts)
 
 def _wizard_prompt_yesno_domingo() -> str:
-    return ("Perfeito! 📅 A rotina é segunda a sábado por padrão.\n"
+    return ("Perfeito!  A rotina é segunda a sábado por padrão.\n"
             "Deseja incluir domingo também?\n"
             "1) sim   2) não   (ou responda *ok* para 'não')")
 
@@ -443,7 +469,7 @@ def _wizard_confirm(user: Dict[str, Any], tmp: Dict[str, Any]) -> str:
         if v: parts.append(f"{pt} {v}")
     rotina = " | ".join(parts) if parts else "—"
     return (
-        "Confere? ✅\n"
+        "Confere? \n"
         f"* Nome: {child}\n"
         f"* Idade: {age}\n"
         f"* Série: {grade}\n"
@@ -465,7 +491,7 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
             return "Digite um nome válido (mín. 2 letras). Qual é o nome da criança?"
         tmp["child_name"] = name
         wz["step"] = "ask_age"
-        return f"Perfeito, {name}! 😊\nQuantos anos ela tem?"
+        return f"Perfeito, {name}! \nQuantos anos ela tem?"
 
     if step == "ask_age":
         m = re.match(r"^\s*(\d{1,2})\s*$", body)
@@ -577,7 +603,7 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
         if tmp.get("guardians"): prof["guardians"] = tmp["guardians"]
         if tmp.get("schedule"):  user["schedule"] = tmp["schedule"]
         user["wizard"] = None
-        return "Cadastro salvo! ✅ Use *status* para ver a rotina do dia, ou escreva *começar aula* quando quiser iniciar."
+        return "Cadastro salvo!  Use *status* para ver a rotina do dia, ou escreva *começar aula* quando quiser iniciar."
 
     return None
 
@@ -585,7 +611,7 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
 # Mensagens e Comandos
 # ======================
 WELCOME = (
-    "Olá! Eu sou a MARIA ANGELA 👋\n"
+    "Olá! Eu sou a MARIA ANGELA \n"
     "Posso acompanhar as atividades diárias de Matemática e Português"
     f"{' e Leitura' if FEATURE_LEITURA else ''}.\n\n"
     "Escolha uma opção:\n"
@@ -638,7 +664,7 @@ def bot() -> Response:
     if lower in ("#resetar", "resetar", "#reset", "reset"):
         d["users"].pop(user_key, None)
         _save(d)
-        msg.body("🔄 Tudo zerado. Digite *iniciar* para começar do zero.")
+        msg.body(" Tudo zerado. Digite *iniciar* para começar do zero.")
         return Response(str(resp), mimetype="application/xml")
 
     if lower in ("reiniciar cadastro", "reset cadastro", "recomeçar cadastro", "recomecar cadastro"):
@@ -660,7 +686,7 @@ def bot() -> Response:
     if lower in ("fim", "finalizar", "concluir", "fechar dia"):
         mark_day_done(user, when=_now())
         _save(d)
-        msg.body("✅ Dia marcado como concluído. Aviso enviado aos responsáveis.")
+        msg.body(" Dia marcado como concluído. Aviso enviado aos responsáveis.")
         return Response(str(resp), mimetype="application/xml")
 
     if lower in ("cancelar aula", "cancelar", "parar aula"):
