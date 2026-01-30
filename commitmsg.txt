@@ -1,3 +1,4 @@
-﻿fix: wizard tem prioridade e menu nao conflita com respostas numericas
-- wizard processa respostas antes de comandos/status
-- menu por letras a/b/c/d sem mapear numeros 1/2/3/4
+﻿fix: corrige syntaxerror no server.py
+- remove f-string quebrado (linha 362) que travava o deploy no Railway
+- mantem fluxo Matematica -> Portugues automatico
+- respostas a/b/c/d e tentativas com dica
