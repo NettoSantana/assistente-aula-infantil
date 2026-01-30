@@ -1,7 +1,8 @@
-﻿fix(server): corrigir colchetes/chaves e finalizar fluxo de aula + check-in
+﻿feat: fluxo automatico matematica -> portugues
 
-- Corrige todas as anotações de tipo (Tuple[...] / Dict[...]) e parênteses
-- Onboarding guiado (múltipla escolha simples) restaurado
-- Fluxo de aula (5x Mat + 1x PT) com MCQ e mark_day_done() ao final
-- Check-in diário: aviso imediato e falta +3h do lembrete
-- Comandos: iniciar, começar/comecar aula, cancelar aula, status, fim
+- Finaliza Matemática e inicia Português automaticamente
+- Mantém 5 questões de Matemática + 5 de Português
+- Respostas por letras (a,b,c,d)
+- Controle de tentativas (até 3, com dica)
+- Sem emojis nas mensagens técnicas
+- Mantido onboarding, check-in diário e comandos existentes
