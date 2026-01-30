@@ -1,8 +1,4 @@
-﻿feat: fluxo automatico matematica -> portugues
-
-- Finaliza Matemática e inicia Português automaticamente
-- Mantém 5 questões de Matemática + 5 de Português
-- Respostas por letras (a,b,c,d)
-- Controle de tentativas (até 3, com dica)
-- Sem emojis nas mensagens técnicas
-- Mantido onboarding, check-in diário e comandos existentes
+﻿fix: corrige syntaxerror no server.py
+- remove f-string quebrado (linha 362) que travava o deploy no Railway
+- mantem fluxo Matematica -> Portugues automatico
+- respostas a/b/c/d e tentativas com dica
