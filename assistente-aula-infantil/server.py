@@ -1,7 +1,11 @@
 # PATH: assistente-aula-infantil/server.py
-# LAST_RECODE: 2026-01-29 22:45 America/Bahia
-# MOTIVO: Priorizar wizard antes de comandos/menu; evitar conflito de respostas numericas com menu; corrigir fluxo de cadastro.
+# LAST_RECODE: 2026-01-29 22:35 America/Bahia
+# MOTIVO: Corrigir SyntaxError (f-string), manter Matematica->Portugues automatico, respostas a/b/c/d, e limpar caracteres especiais.
 
+# Assistente Educacional — Onboarding guiado + Fluxo de Aula (MCQ) + Check-in diario
+# + 5 rodadas de matematica (soma, subtracao, multiplicacao, divisao, mistura)
+# + modulo Portugues (multiplas questoes) apos matematica
+# + comando #resetar e atalho "ok" no onboarding
 import os
 import re
 import random
@@ -10,17 +14,21 @@ from datetime import datetime, timedelta, time as dtime
 
 from flask import Flask, request, Response, jsonify
 
+# Persistencia simples (JSON).
 from storage import load_db, save_db
 
+# Opcional: init
 try:
     from progress import init_user_if_needed  # type: ignore
 except Exception:
     def init_user_if_needed(db: Dict[str, Any], user_key: str) -> None:
         pass
 
+# Twilio
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 
+# Timezone
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
@@ -28,17 +36,23 @@ except Exception:
 
 app = Flask(__name__)
 
+# =========================
+# Config / Flags do projeto
+# =========================
 FEATURE_PORTUGUES = os.getenv("FEATURE_PORTUGUES", "True") == "True"
 FEATURE_LEITURA = os.getenv("FEATURE_LEITURA", "False") == "True"
 AUTO_SEQUENCE_PT_AFTER_MATH = os.getenv("AUTO_SEQUENCE_PT_AFTER_MATH", "True") == "True"
 ROUNDS_PER_DAY = int(os.getenv("ROUNDS_PER_DAY", "5"))
 MAX_MATH_DAY = int(os.getenv("MAX_MATH_DAY", "60"))
 MAX_PT_DAY = int(os.getenv("MAX_PT_DAY", "60"))
+PT_ROUNDS_PER_DAY = int(os.getenv("PT_ROUNDS_PER_DAY", "5"))
 
 PROJECT_TZ = os.getenv("PROJECT_TZ", "America/Bahia")
 
+# Twilio (saidas proativas)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+# Ex.: "whatsapp:+14155238886" sandbox/validado
 TWILIO_FROM = os.getenv("TWILIO_FROM", "")
 
 _twilio_client: Optional[Client] = None
@@ -67,7 +81,7 @@ def _numbers_match(a: Optional[str], b: Optional[str]) -> bool:
 
 def _weekday_key(dt: Optional[datetime] = None) -> str:
     dt = dt or _now()
-    return ["mon","tue","wed","thu","fri","sat","sun"][dt.weekday()]
+    return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][dt.weekday()]
 
 def _parse_hhmm_strict(s: str) -> Optional[dtime]:
     m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", s or "")
@@ -79,9 +93,11 @@ def _parse_hhmm_strict(s: str) -> Optional[dtime]:
     return None
 
 def _parse_time_loose(s: str) -> Optional[dtime]:
+    """Aceita: 8 -> 08:00 | 19h -> 19:00 | 7 pm -> 19:00 | 18:30"""
     s = (s or "").strip().lower()
     t = _parse_hhmm_strict(s)
-    if t: return t
+    if t:
+        return t
     m = re.match(r"^\s*(\d{1,2})\s*(h|pm|am)?\s*$", s)
     if m:
         hh = int(m.group(1))
@@ -97,13 +113,19 @@ def _parse_time_loose(s: str) -> Optional[dtime]:
 def _combine_date_time(date_dt: datetime, hhmm: dtime) -> datetime:
     tz = date_dt.tzinfo
     return datetime(
-        year=date_dt.year, month=date_dt.month, day=date_dt.day,
-        hour=hhmm.hour, minute=hhmm.minute, second=0, tzinfo=tz
+        year=date_dt.year,
+        month=date_dt.month,
+        day=date_dt.day,
+        hour=hhmm.hour,
+        minute=hhmm.minute,
+        second=0,
+        tzinfo=tz,
     )
 
 def _mask_phone(p: Optional[str]) -> str:
     d = _digits_only(p)
-    if len(d) < 2: return "-"
+    if len(d) < 2:
+        return "-"
     return f"+{d[:-2]}**{d[-2:]}"
 
 def _parse_phones_list(s: str) -> List[str]:
@@ -113,15 +135,18 @@ def _parse_phones_list(s: str) -> List[str]:
         d = _digits_only(p)
         if d:
             out.append(d)
-    return out[:2]
+    return out[:2]  # ate 2 responsaveis
 
 def _yes_no(body: str) -> Optional[bool]:
     b = (body or "").strip().lower()
-    if b in ("1", "s", "sim", "yes", "y"): return True
-    if b in ("2", "n", "nao", "não", "no"): return False
+    if b in ("1", "s", "sim", "yes", "y"):
+        return True
+    if b in ("2", "n", "nao", "não", "no"):
+        return False
     return None
 
 def _is_ok(body: str) -> bool:
+    """Atalho de confirmacao/avanco."""
     b = (body or "").strip().lower()
     return b in ("ok", "ok!", "ok.", "okay", "okey")
 
@@ -144,11 +169,17 @@ GRADES = [
 ]
 
 SCHEDULE_ORDER: List[Tuple[str, str]] = [
-    ("mon","seg"),("tue","ter"),("wed","qua"),("thu","qui"),("fri","sex"),("sat","sab"),("sun","dom")
+    ("mon", "seg"),
+    ("tue", "ter"),
+    ("wed", "qua"),
+    ("thu", "qui"),
+    ("fri", "sex"),
+    ("sat", "sab"),
+    ("sun", "dom"),
 ]
 
 def _default_schedule() -> Dict[str, Optional[str]]:
-    return {k: ("19:00" if k != "sun" else None) for k,_ in SCHEDULE_ORDER}
+    return {k: ("19:00" if k != "sun" else None) for k, _ in SCHEDULE_ORDER}
 
 def _get_or_create_user(d: Dict[str, Any], sender: str) -> Tuple[str, Dict[str, Any]]:
     key = _digits_only(sender)
@@ -162,19 +193,19 @@ def _get_or_create_user(d: Dict[str, Any], sender: str) -> Tuple[str, Dict[str, 
         for g in (prof.get("guardians") or []):
             if _numbers_match(sender, g):
                 return k, user
-    user: Dict[str, Any] = {
+    user = {
         "profile": {
             "timezone": PROJECT_TZ,
             "child_phone": None,
-            "guardians": [sender],
+            "guardians": [sender],  # remetente como responsavel
             "child_name": None,
             "child_age": None,
             "grade": None,
         },
         "schedule": _default_schedule(),
-        "daily_state": {},
-        "wizard": None,
-        "lesson": None,
+        "daily_state": {},  # YYYY-MM-DD -> {done, done_ts, done_notified, miss_notified}
+        "wizard": None,  # estado do onboarding
+        "lesson": None,  # sessao de aula
     }
     users[key] = user
     return key, user
@@ -189,15 +220,15 @@ def _send_whatsapp(to_number: str, body: str) -> None:
 def _notify_done(user: Dict[str, Any], day_key: str, late: bool = False) -> None:
     name = ((user.get("profile") or {}).get("child_name") or "A crianca")
     if late:
-        msg = f"{name} concluiu agora as atividades de hoje."
+        msg = f"{name} concluiu agora as atividades de hoje. Obrigado pelo acompanhamento."
     else:
-        msg = f"{name} concluiu as atividades de hoje (Mat/Port{'/Leitura' if FEATURE_LEITURA else ''})."
+        msg = f"{name} concluiu as atividades de hoje (Mat/Port{'/Leitura' if FEATURE_LEITURA else ''}). Bom trabalho."
     for g in (user.get("profile") or {}).get("guardians", []) or []:
         _send_whatsapp(g, msg)
 
 def _notify_miss(user: Dict[str, Any], day_key: str) -> None:
     name = ((user.get("profile") or {}).get("child_name") or "A crianca")
-    msg = f"{name} ainda nao concluiu as atividades de hoje. Precisa de ajuda?"
+    msg = f"{name} ainda nao concluiu as atividades de hoje. Precisa de ajuda para finalizar?"
     for g in (user.get("profile") or {}).get("guardians", []) or []:
         _send_whatsapp(g, msg)
 
@@ -254,7 +285,25 @@ def process_checkin_cron(user: Dict[str, Any], now_dt: Optional[datetime] = None
         return "sent:miss"
     return "skip:not-due"
 
+def _hint_for(q: Dict[str, Any]) -> str:
+    op = q.get("op")
+    a = q.get("a")
+    b = q.get("b")
+    if op == "+":
+        return f"Some: {a} + {b} = ?"
+    if op == "-":
+        return f"Subtraia: {a} - {b} = ?"
+    if op == "*":
+        return f"Pense em tabuada: {a} x {b} = ?"
+    if op == "/":
+        return f"Divida: {a} / {b} = ?"
+    return "Releia a conta com calma."
+
+# ======================
+# Aula — sessao MCQ (Matematica + Portugues)
+# ======================
 def _build_math_question(op: Optional[str] = None) -> Dict[str, Any]:
+    """Gera 1 questao de acordo com a operacao: '+', '-', '*', '/', 'mix'."""
     if op == "mix" or op is None:
         op = random.choice(["+", "-", "*", "/"])
 
@@ -266,7 +315,8 @@ def _build_math_question(op: Optional[str] = None) -> Dict[str, Any]:
         corpus = [x for x in corpus if x >= 0]
     elif op == "-":
         a, b = random.randint(2, 9), random.randint(2, 9)
-        if b > a: a, b = b, a
+        if b > a:
+            a, b = b, a
         correct = a - b
         prompt = f"Quanto e {a} - {b}?"
         corpus = list(range(max(0, correct - 4), correct + 5))
@@ -274,34 +324,39 @@ def _build_math_question(op: Optional[str] = None) -> Dict[str, Any]:
         a, b = random.randint(2, 9), random.randint(2, 9)
         correct = a * b
         prompt = f"Quanto e {a} x {b}?"
-        corpus = [correct + d for d in (-6,-4,-3,-2,-1,1,2,3,4,6) if correct + d > 0]
+        corpus = [correct + d for d in (-6, -4, -3, -2, -1, 1, 2, 3, 4, 6) if correct + d > 0]
     elif op == "/":
         b = random.randint(2, 9)
         q = random.randint(2, 9)
         a = b * q
         correct = q
         prompt = f"Quanto e {a} / {b}?"
-        corpus = [max(1, correct + d) for d in (-3,-2,-1,1,2,3)]
+        corpus = [max(1, correct + d) for d in (-3, -2, -1, 1, 2, 3)]
     else:
         a, b = 2, 2
         correct = 4
         prompt = "Quanto e 2 + 2?"
-        corpus = [1,2,3,4,5,6]
+        corpus = [1, 2, 3, 4, 5, 6]
 
     opts = {correct}
     random.shuffle(corpus)
     for v in corpus:
-        if len(opts) >= 4: break
-        if v != correct: opts.add(v)
+        if len(opts) >= 4:
+            break
+        if v != correct:
+            opts.add(v)
     options = list(opts)
     random.shuffle(options)
     answer_idx = options.index(correct)
+
     return {
         "type": "math",
         "op": op,
+        "a": a,
+        "b": b,
         "prompt": prompt,
         "options": [str(x) for x in options],
-        "answer": answer_idx
+        "answer": answer_idx,  # 0..3
     }
 
 def _build_pt_question() -> Dict[str, Any]:
@@ -310,27 +365,23 @@ def _build_pt_question() -> Dict[str, Any]:
         ("Qual plural esta correto para pao?", ["paos", "paes", "paoses", "paeses"], 1),
         ("Qual forma esta correta?", ["A gente vamos", "A gente vai", "Nos vai", "Nos vamos ir"], 1),
         ("Complete: Ela ___ ao mercado ontem.", ["vai", "foi", "iria", "vou"], 1),
+        ("Qual alternativa e um verbo?", ["casa", "correr", "feliz", "azul"], 1),
     ]
     prompt, options, ans = random.choice(qs)
     return {"type": "pt", "prompt": prompt, "options": options, "answer": ans}
 
-def _options_with_letters(options: List[str]) -> str:
-    letters = ["a","b","c","d"]
-    return "\n".join([f"{letters[i]}) {options[i]}" for i in range(min(4, len(options)))])
-
-def _choice_to_index(body: str) -> Optional[int]:
-    m = re.match(r"^\s*([a-dA-D])\s*$", (body or "").strip())
-    if not m:
-        return None
-    letters = ["a","b","c","d"]
-    return letters.index(m.group(1).lower())
-
 def _start_lesson(user: Dict[str, Any]) -> str:
+    """Cria sessao do dia com 5 rodadas fixas de matematica."""
     ops_order = ["+", "-", "*", "/", "mix"]
     qts: List[Dict[str, Any]] = [_build_math_question(op) for op in ops_order]
-    if FEATURE_PORTUGUES and AUTO_SEQUENCE_PT_AFTER_MATH:
+    user["lesson"] = {"phase": "math", "idx": 0, "q": qts, "hits": 0, "tries": {}, "auto_pt_pending": True}
+    return _present_current_question(user)
+
+def _start_portugues_phase(user: Dict[str, Any]) -> str:
+    qts: List[Dict[str, Any]] = []
+    for _ in range(max(1, PT_ROUNDS_PER_DAY)):
         qts.append(_build_pt_question())
-    user["lesson"] = {"idx": 0, "q": qts, "hits": 0, "tries": {}}
+    user["lesson"] = {"phase": "pt", "idx": 0, "q": qts, "hits": 0, "tries": {}}
     return _present_current_question(user)
 
 def _present_current_question(user: Dict[str, Any]) -> str:
@@ -341,16 +392,22 @@ def _present_current_question(user: Dict[str, Any]) -> str:
         return _finish_lesson(user)
 
     q = qts[idx]
-    tries = int((les.get("tries") or {}).get(idx, 0))
+    tries_map: Dict[int, int] = les.get("tries") or {}
+    tries = int(tries_map.get(idx, 0))
 
     header = "PORTUGUES" if q.get("type") == "pt" else "MATEMATICA"
-
     hint = ""
-    if tries >= 2 and q.get("type") != "pt":
-        hint = "\nDica: revise a conta com calma."
+    if q.get("type") != "pt" and tries >= 2:
+        hint = "\nDica: " + _hint_for(q)
 
-    opts = _options_with_letters(q["options"])
-    return f"{header}\n{q['prompt']}{hint}\nResponda com a, b, c ou d:\n{opts}"
+    letters = ["a", "b", "c", "d"]
+    opts = "\n".join([f"{letters[i]}) {opt}" for i, opt in enumerate(q["options"])])
+    return (
+        f"{header}{hint}\n"
+        f"{q['prompt']}\n"
+        "Responda com a, b, c ou d:\n"
+        f"{opts}"
+    )
 
 def _apply_answer(user: Dict[str, Any], body: str) -> str:
     les = user.get("lesson") or {}
@@ -359,33 +416,75 @@ def _apply_answer(user: Dict[str, Any], body: str) -> str:
     if not qts or idx >= len(qts):
         return "Nao ha aula em andamento. Digite comecar aula."
 
-    choice = _choice_to_index(body)
-    if choice is None:
+    m = re.match(r"^\s*([a-dA-D])\s*$", (body or "").strip())
+    if not m:
         return "Responda apenas com a, b, c ou d."
+
+    letters = ["a", "b", "c", "d"]
+    choice = letters.index(m.group(1).lower())
 
     q = qts[idx]
     correct_idx = int(q["answer"])
 
+    tries_map: Dict[int, int] = les.get("tries") or {}
+    tries = int(tries_map.get(idx, 0))
+
     if choice == correct_idx:
         les["hits"] = int(les.get("hits", 0)) + 1
-        tries_map: Dict[int, int] = les.setdefault("tries", {})
-        tries_map.pop(idx, None)
         les["idx"] = idx + 1
+        tries_map.pop(idx, None)
+        les["tries"] = tries_map
         user["lesson"] = les
+
+        # Se terminou MAT e esta habilitado, inicia PT automaticamente
+        if (
+            les["idx"] >= len(qts)
+            and bool(les.get("auto_pt_pending", False))
+            and FEATURE_PORTUGUES
+            and AUTO_SEQUENCE_PT_AFTER_MATH
+        ):
+            les["auto_pt_pending"] = False
+            user["lesson"] = les
+            return _start_portugues_phase(user)
+
+        if les["idx"] >= len(qts):
+            return _finish_lesson(user)
+
         return _present_current_question(user)
 
-    tries_map2: Dict[int, int] = les.setdefault("tries", {})
-    t = int(tries_map2.get(idx, 0)) + 1
-    tries_map2[idx] = t
+    # Errou: conta tentativa e reenvia a mesma questao (ate 3 tentativas)
+    tries += 1
+    tries_map[idx] = tries
+    les["tries"] = tries_map
     user["lesson"] = les
 
-    if t >= 3:
-        letters = ["a", "b", "c", "d"]
+    if tries >= 3:
         correct_val = q["options"][correct_idx]
         les["idx"] = idx + 1
-        tries_map2.pop(idx, None)
+        tries_map.pop(idx, None)
+        les["tries"] = tries_map
         user["lesson"] = les
-        return f"Nao foi dessa vez. A correta era {letters[correct_idx]}) {correct_val}.\n" + _present_current_question(user)
+
+        if (
+            les["idx"] >= len(qts)
+            and bool(les.get("auto_pt_pending", False))
+            and FEATURE_PORTUGUES
+            and AUTO_SEQUENCE_PT_AFTER_MATH
+        ):
+            les["auto_pt_pending"] = False
+            user["lesson"] = les
+            return (
+                f"Nao foi dessa vez. A correta era {letters[correct_idx]}) {correct_val}.\n"
+                + _start_portugues_phase(user)
+            )
+
+        if les["idx"] >= len(qts):
+            return f"Nao foi dessa vez. A correta era {letters[correct_idx]}) {correct_val}.\n" + _finish_lesson(user)
+
+        return (
+            f"Nao foi dessa vez. A correta era {letters[correct_idx]}) {correct_val}.\n"
+            + _present_current_question(user)
+        )
 
     return "Tente novamente.\n" + _present_current_question(user)
 
@@ -393,32 +492,44 @@ def _finish_lesson(user: Dict[str, Any]) -> str:
     les = user.get("lesson") or {}
     total = len(les.get("q") or [])
     hits = int(les.get("hits", 0))
+    phase = (les.get("phase") or "aula")
     user["lesson"] = None
-    mark_day_done(user, when=_now())
-    return f"Aula concluida. Acertos: {hits}/{total}.\nQuer ver o status do dia?"
 
+    # Marca o dia como feito ao concluir a fase PT (ou se PT estiver desligado)
+    if (phase == "pt") or (not FEATURE_PORTUGUES):
+        mark_day_done(user, when=_now())
+
+    return f"Aula concluida. Acertos: {hits}/{total}. Quer ver o status do dia?"
+
+# ======================
+# Onboarding (wizard) — com atalho "ok"
+# ======================
 def _start_wizard(user: Dict[str, Any]) -> str:
     user["wizard"] = {"step": "ask_name", "tmp": {}}
     return (
         "Oi! Eu sou a MARIA ANGELA, sua assistente de aula.\n"
-        "Vou te acompanhar em atividades de Matematica, Portugues.\n\n"
+        "Vou te acompanhar em atividades de Matematica e Portugues"
+        f"{' e Leitura' if FEATURE_LEITURA else ''}.\n\n"
         "Pra comecar, me diga: qual e o nome da crianca?"
     )
 
 def _wizard_prompt_grade() -> str:
     opts = "\n".join([f"{i+1}) {GRADES[i]}" for i in range(len(GRADES))])
-    return ("E em qual serie/ano ela esta?\n"
-            "Responda o numero ou escreva:\n" + opts)
+    return "E em qual serie/ano ela esta?\nResponda o numero ou escreva:\n" + opts
 
 def _wizard_prompt_yesno_domingo() -> str:
-    return ("Perfeito! A rotina e segunda a sabado por padrao.\n"
-            "Deseja incluir domingo tambem?\n"
-            "1) sim   2) nao   (ou responda ok para nao)")
+    return (
+        "Perfeito. A rotina e segunda a sabado por padrao.\n"
+        "Deseja incluir domingo tambem?\n"
+        "1) sim   2) nao   (ou responda ok para nao)"
+    )
 
 def _wizard_prompt_time_for(day_pt: str) -> str:
-    return (f"Qual horario para {day_pt}? (faixa 05:00-21:30)\n"
-            "Responda o numero ou o horario:\n"
-            "1) 08:00   2) 18:30   3) 19:00   4) 20:00   5) outro   (ou ok para 19:00)")
+    return (
+        f"Qual horario para {day_pt}? (faixa 05:00-21:30)\n"
+        "Responda o numero ou o horario:\n"
+        "1) 08:00   2) 18:30   3) 19:00   4) 20:00   5) outro   (ou ok para 19:00)"
+    )
 
 def _wizard_confirm(user: Dict[str, Any], tmp: Dict[str, Any]) -> str:
     child = tmp.get("child_name") or (user.get("profile") or {}).get("child_name") or "-"
@@ -457,7 +568,7 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
             return "Digite um nome valido (min. 2 letras). Qual e o nome da crianca?"
         tmp["child_name"] = name
         wz["step"] = "ask_age"
-        return f"Perfeito, {name}!\nQuantos anos ela tem?"
+        return f"Perfeito, {name}.\nQuantos anos ela tem?"
 
     if step == "ask_age":
         m = re.match(r"^\s*(\d{1,2})\s*$", body)
@@ -489,12 +600,14 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
                 return _wizard_prompt_grade()
             tmp["grade"] = chosen
         wz["step"] = "ask_child_whatsapp"
-        return ("A crianca tem um numero proprio de WhatsApp?\n"
-                "Envie no formato +55 DDD XXXXX-XXXX ou responda nao tem (ou ok para nao tem).")
+        return (
+            "A crianca tem um numero proprio de WhatsApp?\n"
+            "Envie no formato +55 DDD XXXXX-XXXX ou responda nao tem (ou ok para nao tem)."
+        )
 
     if step == "ask_child_whatsapp":
         b = body.strip().lower()
-        if _is_ok(b) or "nao tem" in b or b in ("nao", "não", "n"):
+        if _is_ok(b) or "nao tem" in b or "não tem" in b or b in ("nao", "não", "n"):
             tmp["child_phone"] = None
         else:
             d = _digits_only(body)
@@ -502,9 +615,11 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
                 return "Envie o WhatsApp da crianca no formato +55 DDD XXXXX-XXXX ou responda nao tem."
             tmp["child_phone"] = d
         wz["step"] = "ask_guardians"
-        return ("Agora, o(s) numero(s) do(s) responsavel(is) (1 ou 2), separados por virgula.\n"
-                "Ex.: +55 71 98888-7777, +55 71 97777-8888\n"
-                "(ou responda ok para manter so o seu numero)")
+        return (
+            "Agora, o(s) numero(s) do(s) responsavel(is) (1 ou 2), separados por virgula.\n"
+            "Ex.: +55 71 98888-7777, +55 71 97777-8888\n"
+            "(ou responda ok para manter so o seu numero)"
+        )
 
     if step == "ask_guardians":
         if _is_ok(body):
@@ -539,8 +654,8 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
             choice = re.match(r"^\s*([1-5])\s*$", s)
             if choice:
                 c = int(choice.group(1))
-                mapping = {1:"08:00", 2:"18:30", 3:"19:00", 4:"20:00"}
-                if c in (1,2,3,4):
+                mapping = {1: "08:00", 2: "18:30", 3: "19:00", 4: "20:00"}
+                if c in (1, 2, 3, 4):
                     val = mapping[c]
                     t = _parse_hhmm_strict(val)
                 else:
@@ -552,22 +667,32 @@ def _handle_wizard(user: Dict[str, Any], body: str) -> Optional[str]:
         tmp.setdefault("schedule", _default_schedule())
         tmp["schedule"][day_key] = f"{t.hour:02d}:{t.minute:02d}"
         wz["step"] = next_step
-        if next_step == "ask_time_tue":  return _wizard_prompt_time_for("ter")
-        if next_step == "ask_time_wed":  return _wizard_prompt_time_for("qua")
-        if next_step == "ask_time_thu":  return _wizard_prompt_time_for("qui")
-        if next_step == "ask_time_fri":  return _wizard_prompt_time_for("sex")
-        if next_step == "ask_time_sat":  return _wizard_prompt_time_for("sab")
+        if next_step == "ask_time_tue":
+            return _wizard_prompt_time_for("ter")
+        if next_step == "ask_time_wed":
+            return _wizard_prompt_time_for("qua")
+        if next_step == "ask_time_thu":
+            return _wizard_prompt_time_for("qui")
+        if next_step == "ask_time_fri":
+            return _wizard_prompt_time_for("sex")
+        if next_step == "ask_time_sat":
+            return _wizard_prompt_time_for("sab")
         return _wizard_confirm(user, tmp)
 
-    if step == "ask_time_mon": return _handle_time_for("mon","seg","ask_time_tue")
-    if step == "ask_time_tue": return _handle_time_for("tue","ter","ask_time_wed")
-    if step == "ask_time_wed": return _handle_time_for("wed","qua","ask_time_thu")
-    if step == "ask_time_thu": return _handle_time_for("thu","qui","ask_time_fri")
-    if step == "ask_time_fri": return _handle_time_for("fri","sex","ask_time_sat")
-    if step == "ask_time_sat": return _handle_time_for("sat","sab","confirm")
+    if step == "ask_time_mon":
+        return _handle_time_for("mon", "seg", "ask_time_tue")
+    if step == "ask_time_tue":
+        return _handle_time_for("tue", "ter", "ask_time_wed")
+    if step == "ask_time_wed":
+        return _handle_time_for("wed", "qua", "ask_time_thu")
+    if step == "ask_time_thu":
+        return _handle_time_for("thu", "qui", "ask_time_fri")
+    if step == "ask_time_fri":
+        return _handle_time_for("fri", "sex", "ask_time_sat")
+    if step == "ask_time_sat":
+        return _handle_time_for("sat", "sab", "confirm")
 
     if step == "confirm":
-        yn: Optional[bool]
         if _is_ok(body):
             yn = True
         else:
@@ -611,19 +736,28 @@ def _status_text(user: Dict[str, Any]) -> str:
     in_lesson = "sim" if user.get("lesson") else "nao"
     return (
         f"Status {day_key}\n"
-        f"- Feito: {'sim' if st['done'] else 'nao'}\n"
-        f"- Lembrete de hoje ({dia}): {rem}\n"
-        f"- Aula em andamento: {in_lesson}\n"
-        f"- Notif. feito: {'sim' if st.get('done_notified') else 'nao'}\n"
-        f"- Notif. falta: {'sim' if st.get('miss_notified') else 'nao'}"
+        f"Feito: {'sim' if st['done'] else 'nao'}\n"
+        f"Lembrete de hoje ({dia}): {rem}\n"
+        f"Aula em andamento: {in_lesson}\n"
+        f"Notif. feito: {'sim' if st.get('done_notified') else 'nao'}\n"
+        f"Notif. falta: {'sim' if st.get('miss_notified') else 'nao'}"
     )
+
+def _normalize_menu_choice(body: str) -> str:
+    b = (body or "").strip().lower()
+    mapping = {
+        "a": "iniciar",
+        "b": "status",
+        "c": "comecar aula",
+        "d": "#resetar",
+    }
+    return mapping.get(b, b)
 
 @app.post("/bot")
 def bot() -> Response:
     d = _db()
-    from_raw = request.values.get("From", "")
+    from_raw = request.values.get("From", "")  # ex.: "whatsapp:+55..."
     body = (request.values.get("Body", "") or "").strip()
-    lower = body.lower()
 
     user_key, user = _get_or_create_user(d, from_raw)
     init_user_if_needed(d, user_key)
@@ -631,32 +765,20 @@ def bot() -> Response:
     resp = MessagingResponse()
     msg = resp.message()
 
-    # Multi-escolha global (só quando NAO estiver em wizard nem em aula)
-    if not user.get("wizard") and not user.get("lesson"):
-        if lower in ("a",): lower = "iniciar"
-        if lower in ("b",): lower = "status"
-        if lower in ("c",): lower = "começar aula"
-        if lower in ("d",): lower = "#resetar"
+    lower = _normalize_menu_choice(body)
 
+    # Comandos de atalho (admin/fluxo)
     if lower in ("#resetar", "resetar", "#reset", "reset"):
         d["users"].pop(user_key, None)
         _save(d)
         msg.body("Tudo zerado. Digite iniciar para comecar do zero.")
         return Response(str(resp), mimetype="application/xml")
 
-    if lower in ("reiniciar cadastro", "reset cadastro", "recomeçar cadastro", "recomecar cadastro"):
+    if lower in ("reiniciar cadastro", "reset cadastro", "recomecar cadastro", "recomeçar cadastro"):
         user["wizard"] = None
         _save(d)
         msg.body(_start_wizard(user))
         return Response(str(resp), mimetype="application/xml")
-
-    # Wizard tem prioridade total
-    if user.get("wizard"):
-        out = _handle_wizard(user, body)
-        if out:
-            msg.body(out)
-            _save(d)
-            return Response(str(resp), mimetype="application/xml")
 
     if lower in ("iniciar", "start"):
         msg.body(_start_wizard(user))
@@ -680,7 +802,16 @@ def bot() -> Response:
         msg.body("Aula cancelada. Quando quiser retomar, envie comecar aula.")
         return Response(str(resp), mimetype="application/xml")
 
-    if lower in ("começar aula", "comecar aula", "iniciar aula", "aula", "começar", "comecar"):
+    # Wizard de cadastro tem prioridade
+    if user.get("wizard"):
+        out = _handle_wizard(user, body)
+        if out:
+            msg.body(out)
+            _save(d)
+            return Response(str(resp), mimetype="application/xml")
+
+    # Iniciar/continuar aula
+    if lower in ("comecar aula", "começar aula", "iniciar aula", "aula", "comecar", "começar"):
         if user.get("lesson"):
             msg.body(_present_current_question(user))
         else:
@@ -688,33 +819,53 @@ def bot() -> Response:
         _save(d)
         return Response(str(resp), mimetype="application/xml")
 
+    # Resposta de aula em andamento
     if user.get("lesson"):
         msg.body(_apply_answer(user, body))
         _save(d)
         return Response(str(resp), mimetype="application/xml")
 
+    # Default
     msg.body(WELCOME)
     _save(d)
     return Response(str(resp), mimetype="application/xml")
 
 @app.get("/admin/cron")
 def cron() -> Response:
+    """Executa a verificacao de check-in para TODOS os usuarios.
+    Use /admin/cron?dry=1 para simular sem enviar.
+    """
     d = _db()
     dry = request.args.get("dry", "0") in ("1", "true", "True")
     now_dt = _now()
 
     results: List[Tuple[str, str]] = []
     for k, user in list((d.get("users") or {}).items()):
-        tag = process_checkin_cron(user, now_dt)
-        results.append((k, tag or "skip"))
+        if dry:
+            tag = _cron_simulate(user, now_dt)
+            results.append((k, tag))
+        else:
+            tag = process_checkin_cron(user, now_dt)
+            results.append((k, tag or "skip"))
 
     if not dry:
         _save(d)
-    return jsonify({
-        "now": now_dt.isoformat(),
-        "dry_run": dry,
-        "results": [{"user": k, "result": r} for k, r in results]
-    })
+    return jsonify(
+        {"now": now_dt.isoformat(), "dry_run": dry, "results": [{"user": k, "result": r} for k, r in results]}
+    )
+
+def _cron_simulate(user: Dict[str, Any], now_dt: datetime) -> str:
+    day_key = _today_str(now_dt)
+    st = _get_day_state(user, day_key)
+    rem_dt = _get_today_reminder_dt(user, base_dt=now_dt)
+    if rem_dt is None:
+        return "SIM:skip:no-schedule"
+    deadline = rem_dt + timedelta(hours=3)
+    if st["done"]:
+        return "SIM:sent:done" if not st.get("done_notified", False) else "SIM:skip:already-done-notified"
+    if now_dt >= deadline and not st.get("miss_notified", False):
+        return "SIM:sent:miss"
+    return "SIM:skip:not-due"
 
 @app.get("/healthz")
 def healthz() -> Response:
