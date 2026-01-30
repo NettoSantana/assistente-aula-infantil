@@ -1,4 +1,3 @@
-﻿fix: corrige syntaxerror no server.py
-- remove f-string quebrado (linha 362) que travava o deploy no Railway
-- mantem fluxo Matematica -> Portugues automatico
-- respostas a/b/c/d e tentativas com dica
+﻿fix: corrigir SyntaxError no server.py
+- corrige f-string quebrada em _present_current_question (Railway crash)
+- normaliza apresentacao e dica na 3a tentativa
